@@ -23,6 +23,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc::UnboundedSender;
 use vt100::{Callbacks, Screen};
 
+use crate::app::control::{Control, is_toggle_request};
+
 use super::caps::{ANSI_PALETTE, Capabilities, DEFAULT_BG, DEFAULT_FG, cell_px, rgb_spec};
 use super::links::SharedLinks;
 
@@ -159,12 +161,16 @@ pub struct ChildCallbacks {
     state: Arc<ChildState>,
     /// Effects destined for the host terminal, drained by the owner loop.
     host: UnboundedSender<Vec<u8>>,
+    /// Some only for the owner pane's parser: the float cannot ask for anything,
+    /// so a request can only ever come from the pane that is allowed to make it.
+    control: Option<Arc<Control>>,
 }
 
 impl ChildCallbacks {
     pub fn new(
         caps: Arc<Capabilities>,
         host: UnboundedSender<Vec<u8>>,
+        control: Option<Arc<Control>>,
     ) -> (Self, ReplySink, Arc<ChildState>) {
         let sink = ReplySink::default();
         let state = Arc::new(ChildState::default());
@@ -173,6 +179,7 @@ impl ChildCallbacks {
             caps,
             state: state.clone(),
             host,
+            control,
         };
         (callbacks, sink, state)
     }
@@ -206,6 +213,17 @@ impl Callbacks for ChildCallbacks {
     }
 
     fn unhandled_osc(&mut self, screen: &mut Screen, params: &[&[u8]]) {
+        // `OSC uncl ; toggle`: a second `uncl` launched in the owner shell, asking
+        // for the float to be toggled instead of nesting (see `app::control`).
+        // Nothing is drawn and nothing is answered: the request is the whole
+        // message, and the sender has already exited.
+        if let Some(control) = &self.control {
+            if is_toggle_request(params) {
+                control.request_toggle();
+                return;
+            }
+        }
+
         // `OSC 8 ; <params> ; <target>`: a hyperlink. This is the only place the
         // cursor still knows which cells the link covers, so the span is
         // recorded here and re-emitted by the renderer.
@@ -462,7 +480,7 @@ mod tests {
     }
 
     fn parser() -> vt100::Parser<ChildCallbacks> {
-        let (callbacks, _sink, _state) = ChildCallbacks::new(caps(), host().0);
+        let (callbacks, _sink, _state) = ChildCallbacks::new(caps(), host().0, None);
         vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks)
     }
 
@@ -611,7 +629,7 @@ mod tests {
 
     #[test]
     fn a_copy_can_be_pasted_back_within_the_session() {
-        let (callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0);
+        let (callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0, None);
         // Stands in for the child's stdin: the sink is installed by the pty writer.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         sink.install(&tx);
@@ -643,7 +661,7 @@ mod tests {
 
     #[test]
     fn a_selector_we_do_not_serve_never_starts_a_clipboard_read() {
-        let (callbacks, sink, state) = ChildCallbacks::new(caps(), host().0);
+        let (callbacks, sink, state) = ChildCallbacks::new(caps(), host().0, None);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         sink.install(&tx);
         let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
@@ -659,7 +677,7 @@ mod tests {
     #[test]
     fn an_audible_bell_only_reaches_the_host_from_the_focused_pane() {
         let (host_tx, mut host_rx) = host();
-        let (mut forward, _sink, state) = ChildCallbacks::new(caps(), host_tx);
+        let (mut forward, _sink, state) = ChildCallbacks::new(caps(), host_tx, None);
         let parser = vt100::Parser::new(nz(4), nz(20), 0);
         let mut screen = parser.screen().clone();
 
@@ -676,7 +694,7 @@ mod tests {
     fn a_window_title_from_a_child_is_recorded_by_the_parser() {
         // `vt100` routes `OSC 0`/`OSC 2` to `set_window_title` itself, so feeding
         // the bytes is the whole path a child takes.
-        let (callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0);
+        let (callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0, None);
         let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
         parser.process(b"\x1b]2;btop\x07");
         assert_eq!(state.title().as_deref(), Some("btop"));
@@ -688,7 +706,7 @@ mod tests {
 
     #[test]
     fn tracks_focus_reporting_enable_and_disable() {
-        let (mut callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0);
+        let (mut callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0, None);
         let mut screen_parser = vt100::Parser::new(nz(4), nz(20), 0);
 
         // 1004 is not modelled by vt100, so it reaches our callback.
@@ -713,7 +731,7 @@ mod tests {
 
     #[test]
     fn sink_delivers_to_the_writer_once_installed() {
-        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0);
+        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0, None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         sink.install(&tx);
 
@@ -749,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_hyperlink_is_recorded_and_drawn_later() {
-        let (mut callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0);
+        let (mut callbacks, _sink, state) = ChildCallbacks::new(caps(), host().0, None);
         let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
 
         callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b"https://x"[..]]);
@@ -767,12 +785,46 @@ mod tests {
     fn an_osc8_is_not_answered() {
         // A hyperlink is not a query: replying would put bytes on the child's
         // stdin that it never asked for.
-        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0);
+        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0, None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         sink.install(&tx);
 
         let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
         callbacks.unhandled_osc(parser.screen_mut(), &[&b"8"[..], &b""[..], &b"https://x"[..]]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_toggle_request_from_the_owner_pane_is_recorded() {
+        // The whole path a second `uncl` takes: bytes on the owner's pty, in as a
+        // private OSC, out as a control request — and nothing else happens.
+        let control = Arc::new(Control::new());
+        let (callbacks, sink, state) = ChildCallbacks::new(caps(), host().0, Some(control.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sink.install(&tx);
+
+        let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
+        parser.process(crate::app::control::TOGGLE_REQUEST);
+
+        assert!(control.take_toggle(), "the request must reach the control");
+        assert!(!control.take_toggle(), "and must be taken exactly once");
+        // No reply to the child (it has already exited), no host effect, no
+        // hyperlink: the sequence is a message, not a query.
+        assert!(rx.try_recv().is_err());
+        assert!(state.links().snapshot().is_empty());
+    }
+
+    #[test]
+    fn the_float_has_no_control_to_fill_in() {
+        // The float's parser is built without a `Control`, so the same bytes are
+        // simply not a request. Nesting is refused before they are ever written,
+        // and this is the second half of that guarantee.
+        let (callbacks, sink, _state) = ChildCallbacks::new(caps(), host().0, None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        sink.install(&tx);
+
+        let mut parser = vt100::Parser::new_with_callbacks(nz(4), nz(20), 0, callbacks);
+        parser.process(crate::app::control::TOGGLE_REQUEST);
         assert!(rx.try_recv().is_err());
     }
 
@@ -787,7 +839,7 @@ mod tests {
     #[test]
     fn clipboard_copies_are_sent_to_the_host_not_the_child() {
         let (host_tx, mut host_rx) = host();
-        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host_tx);
+        let (mut callbacks, sink, _state) = ChildCallbacks::new(caps(), host_tx, None);
 
         // The child's own writer must not see this at all.
         let (child_tx, mut child_rx) = tokio::sync::mpsc::unbounded_channel();

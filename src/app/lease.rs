@@ -1,3 +1,4 @@
+use crate::app::control::Control;
 use crate::app::images::Store;
 use crate::app::pty::{ChildParser, PtySession};
 use crate::app::term::callbacks::{ChildCallbacks, ChildState, ReplySink};
@@ -37,7 +38,9 @@ impl Lease {
         host: UnboundedSender<Vec<u8>>,
         tenant: Overlay,
     ) -> Self {
-        let (parser, sink, state) = new_parser(caps, host);
+        // No control channel: the float may not ask uncl to do anything. Only
+        // the owner pane's parser gets one (see `crate::app::control`).
+        let (parser, sink, state) = new_parser(caps, host, None);
         Self {
             tenant_visible: false,
             tenant_focused: true,
@@ -134,11 +137,16 @@ impl Lease {
 ///
 /// `host` carries the effects that belong to the real terminal (clipboard
 /// copies); everything else is answered back into the child's own pty.
+///
+/// `control` is the pane's channel back into uncl itself, and only the owner
+/// pane has one: it is how a second `uncl` launched in that shell asks for the
+/// float to be toggled instead of nesting (see [`crate::app::control`]).
 pub fn new_parser(
     caps: Arc<crate::app::term::caps::Capabilities>,
     host: UnboundedSender<Vec<u8>>,
+    control: Option<Arc<Control>>,
 ) -> (Arc<RwLock<ChildParser>>, ReplySink, Arc<ChildState>) {
-    let (callbacks, sink, state) = ChildCallbacks::new(caps, host);
+    let (callbacks, sink, state) = ChildCallbacks::new(caps, host, control);
     // Scrollback is inherited from the environment uncl was launched in; see
     // `constants::scrollback_lines`. Both panes get the same capacity.
     let parser = ChildParser::new_with_callbacks(

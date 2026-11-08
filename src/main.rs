@@ -5,11 +5,14 @@ mod geometry;
 use anyhow::Result;
 use std::time::Duration;
 
+use app::control;
+use app::term::caps::ChildRole;
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        None => run(false),
-        Some("--fresh") => run(true),
+        None => launch(false),
+        Some("--fresh") => launch(true),
         Some("--doctor") => {
             doctor();
             Ok(())
@@ -27,6 +30,38 @@ fn main() -> Result<()> {
             help();
             std::process::exit(2);
         }
+    }
+}
+
+/// Start the UI — or, when this shell is already inside uncl, explain or toggle
+/// instead. uncl does not nest.
+///
+/// Which of the two it is comes from `UNCL_ROLE`, which uncl writes into the
+/// environment of every child it spawns:
+///
+/// * **owner** (the shell behind the float) — the terminal this process would
+///   take over is uncl's own. "launch uncl here" therefore means what `Home`
+///   means: raise the float or put it away. The request goes back through the
+///   pty as one private `OSC` and this process exits without drawing a cell; see
+///   [`app::control`].
+/// * **tenant** (the floating shell) — there is already a float *and* a shell
+///   behind it, so a third terminal has nowhere to go. One sentence on stderr,
+///   and exit non-zero so a script can tell.
+///
+/// Flags (`--doctor`, `--version`, `--help`) are not launches: they are handled
+/// above this and still work from inside, because printing a report inside the
+/// float breaks nothing.
+fn launch(fresh: bool) -> Result<()> {
+    match ChildRole::from_env() {
+        Some(ChildRole::Owner) => {
+            control::send_toggle_request()?;
+            Ok(())
+        }
+        Some(ChildRole::Tenant) => {
+            eprintln!("You're already within uncl, nesting refused.");
+            std::process::exit(1);
+        }
+        None => run(fresh),
     }
 }
 
@@ -122,6 +157,10 @@ fn help() {
          Alt+Shift+arrows   resize it\n  \
          Alt+drag           move it with the mouse\n  \
          border drag        resize it with the mouse\n\n\
+         nesting:\n  \
+         uncl does not nest: running it in the background shell toggles the float\n  \
+         exactly like Home, and running it inside the float is refused with a\n  \
+         message instead of opening a terminal in a terminal.\n\n\
          everything else is delivered to whichever terminal has focus.",
         env!("CARGO_PKG_VERSION")
     );

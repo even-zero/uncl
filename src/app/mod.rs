@@ -1,4 +1,5 @@
 pub mod clipboard;
+pub mod control;
 pub mod images;
 pub mod input;
 pub mod lease;
