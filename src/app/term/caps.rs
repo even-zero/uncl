@@ -113,6 +113,11 @@ fn cell_px_source() -> &'static str {
 /// toggled instead of drawing a second one, and a second `uncl` started inside
 /// the float refuses to start at all (see [`crate::app::control`]). Both
 /// decisions are made before the terminal is touched, from `UNCL_ROLE`.
+///
+/// The marker is inherited, so it is only as good as the chain of processes
+/// between the pane and the launch: a terminal multiplexer's panes take their
+/// environment from its *server*, which may be older than the pane. That is why
+/// a launch falls back to the process tree when the marker is missing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildRole {
     /// The shell behind the float: the pane that fills the terminal.
