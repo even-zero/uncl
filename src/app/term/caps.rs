@@ -106,6 +106,48 @@ fn cell_px_source() -> &'static str {
     }
 }
 
+/// Which pane of uncl a child is running in.
+///
+/// uncl does not nest, and the child is the one that has to know: a second
+/// `uncl` started in the owner shell asks for the floating terminal to be
+/// toggled instead of drawing a second one, and a second `uncl` started inside
+/// the float refuses to start at all (see [`crate::app::control`]). Both
+/// decisions are made before the terminal is touched, from `UNCL_ROLE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildRole {
+    /// The shell behind the float: the pane that fills the terminal.
+    Owner,
+    /// The floating shell.
+    Tenant,
+}
+
+impl ChildRole {
+    /// The value children see in `UNCL_ROLE`.
+    pub fn env_value(self) -> &'static str {
+        match self {
+            ChildRole::Owner => "owner",
+            ChildRole::Tenant => "tenant",
+        }
+    }
+
+    /// Which pane this process was started in, or `None` if it was not started
+    /// by uncl at all — a plain shell, or a value this version does not know.
+    /// Anything unrecognised is a normal launch, never a refusal.
+    pub fn from_env() -> Option<Self> {
+        Self::from_value(env::var("UNCL_ROLE").ok()?.as_str())
+    }
+
+    /// The `UNCL_ROLE` parsing, kept separate so it is testable without touching
+    /// the process environment (which is global and, in edition 2024, `unsafe`).
+    fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(ChildRole::Owner),
+            "tenant" => Some(ChildRole::Tenant),
+            _ => None,
+        }
+    }
+}
+
 /// Capabilities of the *host* terminal, as far as uncl is willing to relay them.
 #[derive(Clone, Debug)]
 pub struct Capabilities {
@@ -252,7 +294,10 @@ impl Capabilities {
     /// what it implies, `xterm-256color` where we cannot. `COLORTERM` is inherited
     /// because 24-bit colour survives our own re-encoding intact, and
     /// `UNCL_GRAPHICS` says what the S3 tap carries.
-    pub fn apply_child_env(&self, cmd: &mut portable_pty::CommandBuilder) {
+    ///
+    /// `role` says which pane the child is in, which is what makes "do not nest"
+    /// enforceable by the child itself: see [`ChildRole`].
+    pub fn apply_child_env(&self, cmd: &mut portable_pty::CommandBuilder, role: ChildRole) {
         cmd.env("TERM", self.child_term());
         if self.truecolor {
             cmd.env("COLORTERM", "truecolor");
@@ -260,6 +305,10 @@ impl Capabilities {
         // Shells and tools use this to decide between "dumb" and interactive
         // output; uncl is a real terminal as far as the child is concerned.
         cmd.env("TERM_PROGRAM", "uncl");
+        // Which pane this is. A child that launches `uncl` again reads it back,
+        // so the launch can be turned into a toggle (owner) or refused (float)
+        // instead of nesting — see `crate::app::control`.
+        cmd.env("UNCL_ROLE", role.env_value());
         // Our own namespace, so a script (or the acceptance tests in
         // docs/rendering-report.md) can ask "will uncl carry my images?" without
         // guessing from TERM. Nothing outside uncl reads this.
@@ -438,6 +487,25 @@ mod tests {
         ] {
             assert_eq!(with(term).child_term(), "xterm-256color", "{term:?}");
         }
+    }
+
+    #[test]
+    fn a_role_is_only_read_when_it_is_one_we_wrote() {
+        assert_eq!(ChildRole::from_value("owner"), Some(ChildRole::Owner));
+        assert_eq!(ChildRole::from_value("tenant"), Some(ChildRole::Tenant));
+        // Anything else is a plain launch, not a refusal: a variable leaked from
+        // somewhere else must never stop uncl from starting.
+        assert_eq!(ChildRole::from_value(""), None);
+        assert_eq!(ChildRole::from_value("OWNER"), None);
+        assert_eq!(ChildRole::from_value("nested"), None);
+        assert_eq!(ChildRole::from_value("1"), None);
+    }
+
+    #[test]
+    fn each_role_has_its_own_environment_value() {
+        assert_eq!(ChildRole::Owner.env_value(), "owner");
+        assert_eq!(ChildRole::Tenant.env_value(), "tenant");
+        assert_ne!(ChildRole::Owner.env_value(), ChildRole::Tenant.env_value());
     }
 
     #[test]

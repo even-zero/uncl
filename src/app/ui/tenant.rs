@@ -2,6 +2,7 @@ use crate::app::images::Store;
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::signal::Signal;
 use crate::app::term::callbacks::ReplySink;
+use crate::app::term::caps::ChildRole;
 use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeEdges, content_rect, nz};
 use crate::geometry::Rect;
 
@@ -117,7 +118,10 @@ impl Overlay {
 
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.cwd(std::env::current_dir()?);
-        caps.apply_child_env(&mut cmd);
+        // The float's children are told they are in the float, which is how a
+        // second `uncl` launched here knows to refuse instead of nesting (see
+        // `crate::app::control`).
+        caps.apply_child_env(&mut cmd, ChildRole::Tenant);
 
         let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images), caps)?;
         self.is_dead = false;

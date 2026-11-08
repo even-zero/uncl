@@ -31,6 +31,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use vt100::{MouseProtocolMode, Screen};
 
+use crate::app::control::Control;
 use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
 use crate::app::input::mouse::{self, MouseRoute, Wheel};
 use crate::app::lease::{Lease, new_parser};
@@ -41,7 +42,7 @@ use crate::app::term::dcs;
 use crate::app::signal::Signal;
 use crate::app::render::{FrameLinks, Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
-use crate::app::term::caps::Capabilities;
+use crate::app::term::caps::{Capabilities, ChildRole};
 use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
 use crate::geometry::Rect;
@@ -182,6 +183,10 @@ pub struct Container {
     /// The cell a press landed on, in whichever pane, so a click on a hyperlink
     /// can be told from a drag. `None` when the press was not on a link.
     link_press: Option<LinkPress>,
+    /// What a second `uncl` launched in the owner shell asked for (see
+    /// `crate::app::control`). Filled in by the owner pane's parser, drained by
+    /// the event loop as if it were the `Home` key.
+    control: Arc<Control>,
 }
 
 /// A press that landed on a hyperlink, so its release can be matched to it.
@@ -204,7 +209,11 @@ impl Container {
 
         let caps = Arc::new(Capabilities::from_env());
         let (host_tx, host_rx) = unbounded_channel::<Vec<u8>>();
-        let (parser, parser_sink, parser_state) = new_parser(caps.clone(), host_tx.clone());
+        // The owner pane is the one pane whose child may ask uncl to do
+        // something: `uncl` launched here toggles the float.
+        let control = Arc::new(Control::new());
+        let (parser, parser_sink, parser_state) =
+            new_parser(caps.clone(), host_tx.clone(), Some(control.clone()));
 
         // Starting afresh (first run, --fresh, or no saved state): centre the
         // float at 80x25 in the current viewport.  On restart, recover the
@@ -243,6 +252,7 @@ impl Container {
             owner_scroll: 0,
             tenant_scroll: 0,
             link_press: None,
+            control,
         }
     }
 
@@ -282,7 +292,7 @@ impl Container {
         let mut cmd = CommandBuilder::new(shell);
         cmd.args(["-y", "-i", "--login"]);
         cmd.cwd(std::env::current_dir()?);
-        self.caps.apply_child_env(&mut cmd);
+        self.caps.apply_child_env(&mut cmd, ChildRole::Owner);
 
         let session = pty::spawn(
             cmd,
@@ -434,6 +444,31 @@ impl Container {
             stdout.flush()?;
         }
         Ok(())
+    }
+
+    /// Show the float, or put it away — the `Home` key, and nothing else.
+    ///
+    /// This is also what a second `uncl` launched in the owner shell does: it
+    /// asks for this through the pty rather than nesting, so a launch and the
+    /// key must be the same thing down to the focus hand-off (see
+    /// `crate::app::control`).
+    fn toggle_float(&mut self) {
+        self.lease.tenant_visible = !self.lease.tenant_visible;
+        self.lease.tenant.child_grab = false;
+        // Showing the float takes the keyboard; hiding it gives it back.
+        self.lease.tenant_focused = self.lease.tenant_visible;
+        if self.lease.tenant_visible {
+            self.lease.sync_size();
+        } else {
+            // Hiding the float puts it back on the live view, so it does not
+            // reappear showing history nobody asked to see.
+            self.tenant_scroll = 0;
+            self.link_press = None;
+        }
+        // Children that asked for `?1004` must see the focus move, or every
+        // TUI in the float keeps painting its "unfocused" cursor style.
+        self.refocus(self.float_focused());
+        self.renderer.invalidate();
     }
 
     /// Is the float focused: on screen, alive, and holding the pointer?
@@ -733,22 +768,7 @@ impl Container {
 
         // The one chord uncl keeps for itself is the toggle.
         if key.code == KeyCode::Home && key.modifiers.is_empty() {
-            self.lease.tenant_visible = !self.lease.tenant_visible;
-            self.lease.tenant.child_grab = false;
-            // Showing the float takes the keyboard; hiding it gives it back.
-            self.lease.tenant_focused = self.lease.tenant_visible;
-            if self.lease.tenant_visible {
-                self.lease.sync_size();
-            } else {
-                // Hiding the float puts it back on the live view, so it does not
-                // reappear showing history nobody asked to see.
-                self.tenant_scroll = 0;
-                self.link_press = None;
-            }
-            // Children that asked for `?1004` must see the focus move, or every
-            // TUI in the float keeps painting its "unfocused" cursor style.
-            self.refocus(self.float_focused());
-            self.renderer.invalidate();
+            self.toggle_float();
             return Flow::Redraw;
         }
 
@@ -1119,6 +1139,17 @@ impl Container {
                 }
             }
 
+            // A second `uncl` started in the owner shell asked for the float to
+            // be toggled instead of nesting. It is the `Home` key arriving
+            // through the pty, so it is applied before the focus-dependent
+            // housekeeping below: a launch must leave the host's mouse grab and
+            // cursor exactly where the key would leave them (see
+            // `crate::app::control`).
+            if self.control.take_toggle() {
+                self.toggle_float();
+                redraw = true;
+            }
+
             // The host's mouse mode, cursor shape and clipboard all follow the
             // focused child; doing it here means one place handles toggles,
             // resizes and child restarts.
@@ -1458,6 +1489,57 @@ mod tests {
             .at_least_press(),
             HostMouse::AnyMotion
         );
+    }
+
+    #[test]
+    fn launching_uncl_in_the_owner_pane_toggles_the_float_like_home() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        let was_visible = container.lease.tenant_visible;
+
+        // What a second `uncl`, started in the owner shell, writes to that
+        // pane's pty before it exits.
+        container
+            .parser
+            .write()
+            .unwrap()
+            .process(crate::app::control::TOGGLE_REQUEST);
+        assert!(
+            container.control.take_toggle(),
+            "the owner pane's parser must turn the sequence into a request"
+        );
+        assert!(
+            !container.control.take_toggle(),
+            "the request is taken once, not on every frame"
+        );
+
+        container.toggle_float();
+        assert_eq!(container.lease.tenant_visible, !was_visible);
+        assert_eq!(container.lease.tenant_focused, !was_visible);
+
+        // And the key does exactly the same thing: one toggle back.
+        let flow = container.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(flow, Flow::Redraw);
+        assert_eq!(container.lease.tenant_visible, was_visible);
+    }
+
+    #[test]
+    fn the_float_is_given_no_control_channel() {
+        // A `Control` in the float could only ever be filled by a child that
+        // should have refused to start; the parser it gets has none.
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        let before = container.lease.tenant_visible;
+
+        container
+            .lease
+            .tenant_parser
+            .write()
+            .unwrap()
+            .process(crate::app::control::TOGGLE_REQUEST);
+        assert!(!container.control.take_toggle());
+        container.toggle_float();
+        assert_eq!(container.lease.tenant_visible, !before);
     }
 
     #[test]
