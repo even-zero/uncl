@@ -47,14 +47,21 @@ fn main() -> Result<()> {
 /// * **refuse** — inside the float, or inside uncl through a multiplexer (which
 ///   would swallow the request and nest anyway). One sentence on stderr, exit
 ///   non-zero so a script can tell.
-/// * **launch** — anything else.
+/// * **launch** — anything else. When the UI hands the terminal back to the shell
+///   that started us, that is the last moment uncl exists, and it says so.
 ///
 /// Flags (`--doctor`, `--version`, `--help`) are not launches: they are handled
 /// above this and still work from inside, because printing a report inside the
 /// float breaks nothing.
 fn launch(fresh: bool) -> Result<()> {
     match Nesting::get().launch() {
-        Launch::Ui => run(fresh),
+        // The UI has handed the terminal back to the shell that started us, so
+        // this is the last thing uncl says: a word on the way out.
+        Launch::Ui => {
+            run(fresh)?;
+            println!("uncl says, when the money's gone, it's time to move on.");
+            Ok(())
+        }
         // The same request `Home` makes, over the pane's own pty; see `control`.
         Launch::Toggle => Ok(control::send_toggle_request()?),
         Launch::Refuse(hint) => {
