@@ -59,13 +59,13 @@ fn launch(fresh: bool) -> Result<()> {
         // this is the last thing uncl says: a word on the way out.
         Launch::Ui => {
             run(fresh)?;
-            println!("uncl says, when the money's gone, it's time to move on.");
+            println!("uncl says, \"when the money's gone, it's time to move on.\"");
             Ok(())
         }
         // The same request `Home` makes, over the pane's own pty; see `control`.
         Launch::Toggle => Ok(control::send_toggle_request()?),
         Launch::Refuse(hint) => {
-            eprintln!("You're already within uncl, nesting refused.");
+            eprintln!("You're already within uncl, nesting prohibited.");
             if let Some(hint) = hint {
                 eprintln!("{hint}");
             }

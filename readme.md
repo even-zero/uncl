@@ -74,22 +74,6 @@ launched in:
   scrollback is not available inside uncl. uncl's is. `Shift`+drag still selects
   text in most emulators, because they take that key back locally.
 
-### nesting
-
-uncl does not nest. there is one float, and it is the one you already have:
-
-- running `uncl` in the shell behind the float does what `[Home]` does - it
-  raises the float, or puts it away.
-- running `uncl` inside the float prints
-  `You're already within uncl, nesting refused.` and exits with status 1.
-
-either way the terminal is left alone: the second process never draws a frame,
-never enters the alternate screen and never touches raw mode. the two panes are
-told apart by `UNCL_ROLE`, which uncl writes into the environment of every child
-it spawns, and the toggle request travels back over the pane's own pty, so there
-is nothing to start, stop or clean up. `uncl --doctor`, `--version` and `--help`
-still work from either pane: a report is not a launch.
-
 ## installing
 
 prebuilt archives are attached to the releases: `uncl-linux-x86_64.tar.gz`,
