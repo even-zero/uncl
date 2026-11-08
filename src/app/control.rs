@@ -14,11 +14,17 @@
 //! this one into a [`Control`] request; the event loop drains it like a key
 //! press.
 //!
-//! Which of the two answers a launch gets is decided by
-//! [`crate::app::term::caps::ChildRole`], read from `UNCL_ROLE`: a child of the
-//! owner pane asks for the toggle, a child of the float refuses to start. Only
-//! the owner's parser is given a [`Control`], so even a child that emitted these
-//! bytes by hand could not move a float that belongs to someone else.
+//! Which of the two answers a launch gets is decided where a launch is: from the
+//! `UNCL_ROLE` marker the pane's child inherits and the process tree above it. A
+//! child of the owner pane asks for the toggle, a child of the float refuses to
+//! start. Only the owner's parser is given a [`Control`], so even a
+//! child that emitted these bytes by hand could not move a float that belongs to
+//! someone else.
+//!
+//! The reason this channel is a *sequence* and not a socket is also why it
+//! cannot cross a terminal multiplexer: whoever owns the pane's pty parses that
+//! output, and a multiplexer does not forward an `OSC` it does not model. A
+//! launch behind one asks for nothing and is refused instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
