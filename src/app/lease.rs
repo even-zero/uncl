@@ -82,7 +82,6 @@ impl Lease {
 
         match session.exited.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => {
-                self.tenant.is_dead = true;
                 // Drops the session: kills the (already dead) child and lets
                 // its threads finish.
                 self.session = None;

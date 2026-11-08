@@ -232,9 +232,12 @@ resize it. `Ctrl+Alt+q` quits. `Ctrl+Alt+Up/Down` and `Ctrl+Alt+PageUp/PageDown`
 scroll the focused pane. Everything else is delivered to whichever pane owns the
 keyboard.
 
-**A crashing float cannot take the owner down.** The float's shell exiting respawns
-it (visible again if it was visible); a failing `exec` is backed off rather than
-retried every tick, and a failure there never propagates out of the event loop.
+**A crashing float cannot take the owner down.** The float's shell exiting closes
+the float - `exit` is how you close a terminal, so it stays closed instead of
+being resurrected under your hands - and the next `Home` starts its replacement at
+the geometry and pin the float last had. A failing `exec` is backed off rather
+than retried on every key press, and a failure there never propagates out of the
+event loop.
 
 ---
 

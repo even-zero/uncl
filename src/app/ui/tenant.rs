@@ -28,7 +28,6 @@ pub struct Overlay {
     /// one axis, a corner press both.
     pub resize_anchored: ResizeEdges,
     pub size: Size,
-    pub is_dead: bool,
     /// A gesture started inside the child's grid: it owns the pointer until the
     /// button comes up, even if the pointer leaves the float.
     pub child_grab: bool,
@@ -50,7 +49,6 @@ impl Overlay {
                 cols: rect.width,
                 rows: rect.height,
             },
-            is_dead: true,
             child_grab: false,
             pinned: false,
         }
@@ -124,7 +122,6 @@ impl Overlay {
         caps.apply_child_env(&mut cmd, ChildRole::Tenant);
 
         let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images), caps)?;
-        self.is_dead = false;
         Ok(session)
     }
 
