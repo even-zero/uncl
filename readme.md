@@ -20,6 +20,8 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 ## features
 
 - toggle a floating terminal with a single `[Home]` key
+- `exit` in the float closes it; the next `[Home]` opens a fresh shell (nothing
+  is restarted behind your back)
 - no nesting: running `uncl` again in the background shell toggles the float,
   and running it inside the float is refused with a message
 - pin the float in place with the `[ ]` 

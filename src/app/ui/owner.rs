@@ -452,23 +452,105 @@ impl Container {
     /// asks for this through the pty rather than nesting, so a launch and the
     /// key must be the same thing down to the focus hand-off (see
     /// `crate::app::control`).
+    ///
+    /// Raising the float is also the only thing that starts a replacement shell
+    /// after the last one exited: `exit` closes the window (`tenant_closed`) and
+    /// leaves it closed, so a toggle is a decision the user makes rather than
+    /// something that happens under their hands.
     fn toggle_float(&mut self) {
-        self.lease.tenant_visible = !self.lease.tenant_visible;
-        self.lease.tenant.child_grab = false;
-        // Showing the float takes the keyboard; hiding it gives it back.
-        self.lease.tenant_focused = self.lease.tenant_visible;
         if self.lease.tenant_visible {
-            self.lease.sync_size();
+            self.hide_float();
         } else {
-            // Hiding the float puts it back on the live view, so it does not
-            // reappear showing history nobody asked to see.
-            self.tenant_scroll = 0;
-            self.link_press = None;
+            self.show_float();
         }
+    }
+
+    /// Raise the float, starting its shell if the last one exited.
+    fn show_float(&mut self) {
+        if !self.tenant_running() && !self.respawn_tenant() {
+            // The replacement could not start (`$SHELL` missing, out of fds).
+            // Stay closed rather than paint a window nothing can be typed into;
+            // `tenant_retry_after` keeps repeated toggles from hammering exec.
+            return;
+        }
+
+        self.lease.tenant_visible = true;
+        // Showing the float takes the keyboard.
+        self.lease.tenant_focused = true;
+        self.lease.tenant.child_grab = false;
+        self.lease.sync_size();
         // Children that asked for `?1004` must see the focus move, or every
         // TUI in the float keeps painting its "unfocused" cursor style.
         self.refocus(self.float_focused());
         self.renderer.invalidate();
+    }
+
+    /// Put the float away, leaving its shell running.
+    fn hide_float(&mut self) {
+        self.lease.tenant_visible = false;
+        // Hiding the float gives the keyboard back.
+        self.lease.tenant_focused = false;
+        self.lease.tenant.child_grab = false;
+        // Hiding the float puts it back on the live view, so it does not
+        // reappear showing history nobody asked to see.
+        self.tenant_scroll = 0;
+        self.link_press = None;
+        self.refocus(self.float_focused());
+        self.renderer.invalidate();
+    }
+
+    /// The float's shell is gone: close the window, keep where it was.
+    ///
+    /// The overlay survives (position, pin) so the next toggle opens in the same
+    /// place; only the session is gone, dropped by [`Lease::poll_exit`]. Nothing
+    /// restarts the shell here on purpose — see [`Self::toggle_float`].
+    fn tenant_closed(&mut self) {
+        self.lease.tenant_visible = false;
+        self.lease.tenant_focused = false;
+        self.lease.tenant.child_grab = false;
+        self.tenant_scroll = 0;
+        self.link_press = None;
+        // Those pictures belong to a process that no longer exists.
+        self.renderer.forget_images();
+        // The keyboard goes back to the owner shell.
+        self.refocus(self.float_focused());
+        self.renderer.invalidate();
+    }
+
+    /// Start a replacement shell for the float, keeping the geometry and pin the
+    /// user left it with. Returns `false` when the spawn failed.
+    ///
+    /// Only called from [`Self::show_float`]: a shell that exits must not be
+    /// resurrected behind the user's back, which is what made `exit` in the
+    /// float impossible before.
+    fn respawn_tenant(&mut self) -> bool {
+        let now = Instant::now();
+        // A failed exec is backed off rather than retried on every key press.
+        if self.tenant_retry_after.is_some_and(|at| now < at) {
+            return false;
+        }
+
+        let rect = self.lease.tenant.rect;
+        let pinned = self.lease.tenant.pinned;
+        let mut overlay = Overlay::with_rect(rect);
+        overlay.pinned = pinned;
+        self.lease = Lease::new(self.caps.clone(), self.host_tx.clone(), overlay);
+
+        match self.init_tenant() {
+            Ok(()) => {
+                self.tenant_scroll = 0;
+                self.link_press = None;
+                self.tenant_retry_after = None;
+                // The old child's pictures belong to a process that no longer
+                // exists; the new one starts from an empty image layer.
+                self.renderer.forget_images();
+                true
+            }
+            Err(_) => {
+                self.tenant_retry_after = Some(now + TENANT_RESPAWN_BACKOFF);
+                false
+            }
+        }
     }
 
     /// Is the float focused: on screen, alive, and holding the pointer?
@@ -1087,7 +1169,14 @@ impl Container {
         loop {
             // 1. Housekeeping first, so a child flooding output cannot starve
             //    exit detection (all checks are non-blocking).
+            //
+            // The float's shell exiting (`exit`, or a crash) closes the float.
+            // It is deliberately *not* restarted here: `exit` is the user
+            // closing their terminal, so the next `Home` is what opens a fresh
+            // one (`toggle_float`). Respawning straight away is what used to
+            // make `exit` in the float impossible.
             if self.lease.poll_exit() {
+                self.tenant_closed();
                 redraw = true;
             }
 
@@ -1095,47 +1184,6 @@ impl Container {
                 match session.exited.try_recv() {
                     Ok(()) | Err(TryRecvError::Disconnected) => break,
                     Err(TryRecvError::Empty) => {}
-                }
-            }
-
-            // The float's shell is gone (the user typed `exit`, or it crashed):
-            // give them a fresh prompt instead of a dead window. A failed exec
-            // is backed off rather than retried every tick, and it must never
-            // take the owner shell down with it — losing the user's session
-            // because a floating shell could not start is the worst outcome here.
-            if self.lease.tenant.is_dead {
-                let now = Instant::now();
-                let due = self.tenant_retry_after.is_none_or(|at| now >= at);
-
-                if due {
-                    let was_visible = self.lease.tenant_visible;
-                    let was_pinned = self.lease.tenant.pinned;
-                    let was_focused = self.lease.tenant_focused;
-                    // Preserve the geometry the user left the float at so the
-                    // respawned child comes up at the same size and position.
-                    let was_rect = self.lease.tenant.rect;
-                    let mut overlay = Overlay::with_rect(was_rect);
-                    overlay.pinned = was_pinned;
-                    self.lease = Lease::new(self.caps.clone(), self.host_tx.clone(), overlay);
-
-                    match self.init_tenant() {
-                        Ok(()) => {
-                            self.lease.tenant_visible = was_visible;
-                            self.lease.tenant_focused = was_focused;
-                            self.tenant_scroll = 0;
-                            self.link_press = None;
-                            self.tenant_retry_after = None;
-                            self.renderer.invalidate();
-                            // The old child's pictures belong to a process that
-                            // no longer exists; the new one starts from an empty
-                            // image layer.
-                            self.renderer.forget_images();
-                        }
-                        Err(_) => {
-                            self.tenant_retry_after = Some(now + TENANT_RESPAWN_BACKOFF);
-                        }
-                    }
-                    redraw = true;
                 }
             }
 
@@ -1521,6 +1569,60 @@ mod tests {
         let flow = container.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(flow, Flow::Redraw);
         assert_eq!(container.lease.tenant_visible, was_visible);
+    }
+
+    #[test]
+    fn exiting_the_float_closes_it_instead_of_respawning_it() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = true;
+        container.lease.tenant.pinned = true;
+        container.tenant_scroll = 7;
+        let rect = container.lease.tenant.rect;
+
+        // The dummy session's exit channel is already disconnected, which is
+        // what the loop reads as "the child is gone".
+        assert!(container.lease.poll_exit());
+        assert!(!container.tenant_running(), "the session must be gone");
+
+        container.tenant_closed();
+
+        assert!(
+            !container.lease.tenant_visible,
+            "the window closes with its shell, and stays closed"
+        );
+        assert!(!container.lease.tenant_focused);
+        assert!(!container.float_focused());
+        assert_eq!(container.tenant_scroll, 0);
+        // The geometry and the pin survive, so the next toggle opens where the
+        // last float was.
+        assert_eq!(container.lease.tenant.rect, rect);
+        assert!(container.lease.tenant.pinned);
+    }
+
+    #[test]
+    fn a_toggle_after_exit_does_not_open_an_empty_window() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.poll_exit();
+        container.tenant_closed();
+
+        // A replacement shell that failed to start is backed off rather than
+        // retried on every key press: until the backoff expires, the toggle must
+        // leave the float closed instead of showing a window nothing can type
+        // into. (A successful replacement needs a real pty and is not reachable
+        // from a unit test.)
+        container.tenant_retry_after = Some(Instant::now() + Duration::from_secs(60));
+        container.toggle_float();
+        assert!(
+            !container.lease.tenant_visible,
+            "no dead window while the backoff is in force"
+        );
+
+        // The request to respawn is what the toggle would have made; the closed
+        // float is the only reason it did not happen.
+        assert!(container.tenant_retry_after.is_some());
     }
 
     #[test]

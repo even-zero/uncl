@@ -98,7 +98,8 @@ pub const INPUT_DRAIN_BUDGET: usize = 512;
 
 /// How long to wait before trying to respawn the floating shell again after a
 /// failure. `exec` can fail for reasons that need user action (a broken `$SHELL`,
-/// a deleted cwd), and retrying every 100 ms tick would spin the event loop.
+/// a deleted cwd), and a toggle is what asks for a replacement shell, so this
+/// keeps repeated `Home` presses from hammering it.
 pub const TENANT_RESPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Cap on how many bytes we coalesce into a single write to a child PTY.
