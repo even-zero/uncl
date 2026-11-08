@@ -191,7 +191,10 @@ impl fmt::Display for Nesting {
             Launch::Refuse(None) => "refuse to nest",
         };
 
-        write!(f, "UNCL_ROLE={role}, {above}; a launch here would {verdict}")
+        write!(
+            f,
+            "UNCL_ROLE={role}, {above}; a launch here would {verdict}"
+        )
     }
 }
 
@@ -326,24 +329,29 @@ mod tests {
 
     #[test]
     fn the_walk_reports_ancestors_only_and_always_ends() {
-        let table = std::collections::HashMap::from([
-            (100, (String::from("uncl"), 200)), // this process: never reported
-            (200, (String::from("sh"), 1)),
-            (1, (String::from("systemd"), 0)),
-        ]);
-        assert_eq!(walk(|pid| table.get(&pid).cloned()), ["sh", "systemd"]);
+        // `walk` starts at this process's pid, so the fake tree is relative to
+        // it: us -> shell -> systemd -> init. No literal pids anywhere.
+        let me = std::process::id();
+        let tree = |pid: u32| match pid {
+            p if p == me => Some((String::from("uncl"), me + 1)), // never reported
+            p if p == me + 1 => Some((String::from("sh"), me + 2)),
+            p if p == me + 2 => Some((String::from("systemd"), 0)),
+            _ => None,
+        };
+        assert_eq!(walk(tree), ["sh", "systemd"]);
 
         // Self-parented: a broken table cannot loop the walk.
-        let self_parented = std::collections::HashMap::from([(100, (String::from("sh"), 100))]);
-        assert!(walk(|pid| self_parented.get(&pid).cloned()).is_empty());
+        assert!(walk(|pid| Some((String::from("sh"), pid))).is_empty());
 
         // Unreadable pid: the table moved under us; stop rather than guess.
         assert!(walk(|_| None).is_empty());
 
-        // Infinitely deep: the cap ends it.
-        assert_eq!(walk(|pid| Some((format!("p{pid}"), pid + 1))).len(), DEPTH);
+        // Infinitely deep: the cap ends it, and only ancestors are in the list.
+        let deep = walk(|pid| Some((format!("p{pid}"), pid + 1)));
+        assert_eq!(deep.len(), DEPTH);
+        assert_eq!(deep[0], format!("p{}", me + 1));
+        assert!(!deep.iter().any(|name| name == &format!("p{me}")));
     }
-
     #[test]
     fn a_stat_line_is_read_from_the_last_parenthesis() {
         let uncl = Some((String::from("uncl"), 7));
