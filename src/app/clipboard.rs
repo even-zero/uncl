@@ -1,4 +1,5 @@
-//! Reading the *system* clipboard, for `OSC 52 ; <sel> ; ?`.
+//! The system clipboard, both ways: reading it for `OSC 52 ; <sel> ; ?`, and
+//! writing it for uncl's own copy.
 //!
 //! A child asking to paste is asking the terminal, and the terminal's clipboard is
 //! the desktop's. uncl cannot ask the host terminal for it: the reply travels back
@@ -16,6 +17,7 @@
 //! a desktop: which selection a selector means, which programs to try, and the
 //! base64 the reply needs.
 
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// The largest clipboard this will hand a child.
@@ -24,7 +26,16 @@ use std::process::{Command, Stdio};
 /// traffic, which is already generous for a paste. Anything bigger is far more
 /// likely to be a copied file than text, and a terminal that streams it into a
 /// shell is not doing the user a favour.
-pub const MAX_CLIPBOARD: usize = 1024 * 1024;
+pub const MAX_CLIPBOARD: usize = 8 * 1024 * 1024;
+
+/// The largest copy this will hand the *host terminal* over `OSC 52`.
+///
+/// Terminals cap what they will take (`xterm` stops at 100 kB) and a capped
+/// write does not fail — it lands cut in half, which is a clipboard that looks
+/// fine and pastes a fragment. So a copy bigger than this goes to the host only
+/// when nothing on the desktop could take it, since then a fragment is the best
+/// there is.
+pub const MAX_OSC52: usize = 64 * 1024;
 
 /// Which clipboard an `OSC 52` selector asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +161,135 @@ pub fn read(ty: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Programs that can *take* the clipboard, in the order to try them.
+///
+/// The same set as the readers above, with the write flags: Wayland first (an
+/// `xclip` on a Wayland session talks to nothing), then X11, then the platform's
+/// own.
+#[cfg(target_os = "linux")]
+fn writers() -> &'static [&'static [&'static str]] {
+    &[
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard", "-i"],
+        &["xsel", "--clipboard", "--input"],
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn writers() -> &'static [&'static [&'static str]] {
+    &[&["pbcopy"]]
+}
+
+#[cfg(windows)]
+fn writers() -> &'static [&'static [&'static str]] {
+    // `Set-Clipboard` takes a value, not stdin: `-Value` with the whole stream is
+    // the shortest way to say "everything that was piped in".
+    &[
+        &[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ],
+        &[
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ],
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn writers() -> &'static [&'static [&'static str]] {
+    &[&["pbcopy"]]
+}
+
+/// The `OSC 52` write that puts `text` on the host terminal's clipboard.
+///
+/// This is the half that works where no desktop program does: over ssh, in a
+/// container, on a machine whose compositor nothing in this list can reach. The
+/// host decides what to do with it — a terminal that has `OSC 52` disabled simply
+/// drops it, which is why [`copy`] is asked as well.
+pub fn osc52(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 16);
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(&base64(text.as_bytes()));
+    out.push(b'\x07');
+    out
+}
+
+/// The `OSC 52` write a copy should send, if the host terminal should get one.
+///
+/// Both clipboards are written when both can carry the text: the desktop
+/// programs are not always installed (over `ssh`, in a container), and the host
+/// terminal is not always allowed to write its clipboard. The one case to avoid
+/// is a large copy: the host would truncate it, and a truncated clipboard is
+/// worse than one that was left alone — `carried` says a desktop program took
+/// the whole text, which is what makes leaving the host out safe.
+pub fn host_copy(text: &str, carried: bool) -> Option<Vec<u8>> {
+    match (carried, text.len() > MAX_OSC52) {
+        (true, true) => None,
+        (_, false) => Some(osc52(text)),
+        // Nothing on the desktop took it, so the host is the only clipboard
+        // there is: give it as much as it can hold, cut on a line so what lands
+        // is the beginning of the copy rather than a fragment of the middle.
+        (false, true) => Some(osc52(host_prefix(text))),
+    }
+}
+
+/// The prefix of `text` a host terminal can take, cut on a line boundary.
+fn host_prefix(text: &str) -> &str {
+    let mut cut = MAX_OSC52.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    match text[..cut].rfind('\n') {
+        Some(newline) if newline > 0 => &text[..=newline],
+        _ => &text[..cut],
+    }
+}
+
+/// Put `text` on the system clipboard, if a program will take it.
+///
+/// The writers that own a selection (`wl-copy`, `xclip`, `xsel`) stay resident
+/// until something replaces them, so this cannot wait for them: the text is written
+/// and the child reaped on a thread of its own, and `true` means only that one of
+/// them accepted the job. A program that is not installed is not an error — the
+/// next candidate is tried, and if none of them starts, the caller still has
+/// [`osc52`].
+pub fn copy(text: &str) -> bool {
+    for argv in writers() {
+        let Some((program, args)) = argv.split_first() else {
+            continue;
+        };
+        let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            continue;
+        };
+        let payload = text.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+            // Closing the pipe is what tells them the text is complete.
+            drop(stdin);
+            // They stay alive while they own the selection, so this waits for as
+            // long as the clipboard holds this copy — on a thread, where it costs
+            // nothing.
+            let _ = child.wait();
+        });
+        return true;
+    }
+    false
+}
+
 /// Standard base64, as `OSC 52` wants it.
 ///
 /// Hand-rolled for the same reason the decoder in `app::images` is: it is twenty
@@ -182,6 +322,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_large_copy_leaves_the_host_clipboard_alone_when_a_program_took_it() {
+        assert!(host_copy("hi\n", true).is_some());
+        assert!(host_copy("hi\n", false).is_some());
+
+        let large = "x".repeat(MAX_OSC52 + 1);
+        assert!(
+            host_copy(&large, true).is_none(),
+            "the host would truncate it, and the desktop already has it all"
+        );
+        assert!(
+            host_copy(&large, false).is_some(),
+            "with nothing else to take it, a truncated copy beats none"
+        );
+    }
+
+    #[test]
+    fn a_copy_too_big_for_the_host_is_cut_on_a_line() {
+        let text = "a".repeat(MAX_OSC52 - 1) + "\n" + &"b".repeat(10);
+        let prefix = host_prefix(&text);
+        assert!(prefix.len() <= MAX_OSC52);
+        assert!(prefix.ends_with('\n'), "cut between lines, not inside one");
+
+        let unbroken = "x".repeat(MAX_OSC52 * 2);
+        assert_eq!(host_prefix(&unbroken).len(), MAX_OSC52);
+
+        // Anything that fits is handed over whole.
+        assert_eq!(host_prefix("hi\n"), "hi\n");
+    }
+
+    #[test]
     fn base64_matches_the_standard_vectors() {
         assert!(base64(b"").is_empty());
         // The RFC 4648 examples, one per tail length.
@@ -196,6 +366,28 @@ mod tests {
         // Every byte value, so the high bits are covered.
         let all: Vec<u8> = (0..=255u8).collect();
         assert_eq!(base64(&all).len(), 344);
+    }
+
+    #[test]
+    fn the_osc52_write_is_bracketed_and_base64_encoded() {
+        // `BEL`-terminated, because an unterminated `OSC 52` swallows whatever
+        // the next frame puts on the wire.
+        assert_eq!(osc52("hi\n"), b"\x1b]52;c;aGkK\x07".to_vec());
+        assert_eq!(osc52(""), b"\x1b]52;c;\x07".to_vec());
+        // One selector only: the clipboard. Handing a copy to the primary
+        // selection as well is what makes a paste in another window a surprise.
+        let sequence = osc52("x");
+        assert!(sequence.starts_with(b"\x1b]52;c;"));
+        assert!(!String::from_utf8_lossy(&sequence).contains(";p;"));
+    }
+
+    #[test]
+    fn the_clipboard_always_has_a_program_to_write_with() {
+        assert!(!writers().is_empty());
+        for argv in writers() {
+            assert!(!argv.is_empty(), "a writer with no program name");
+            assert!(!argv[0].is_empty());
+        }
     }
 
     #[test]

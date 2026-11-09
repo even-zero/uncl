@@ -31,16 +31,17 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use vt100::{MouseProtocolMode, Screen};
 
+use crate::app::clipboard;
 use crate::app::control::Control;
 use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
-use crate::app::input::mouse::{self, MouseRoute, Wheel};
+use crate::app::input::mouse::{self, MouseRoute, Selection, Wheel};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::state::{load_tenant_geometry, save_tenant_geometry};
 use crate::app::term::callbacks::ChildState;
 use crate::app::term::dcs;
 use crate::app::signal::Signal;
-use crate::app::render::{FrameLinks, Panes, Renderer};
+use crate::app::render::{FrameLinks, Highlight, Panes, Renderer};
 use crate::app::term::callbacks::ReplySink;
 use crate::app::term::caps::{Capabilities, ChildRole};
 use crate::app::ui::tenant::Overlay;
@@ -191,6 +192,11 @@ pub struct Container {
     /// The cell a press landed on, in whichever pane, so a click on a hyperlink
     /// can be told from a drag. `None` when the press was not on a link.
     link_press: Option<LinkPress>,
+    /// The selection, in the document coordinates of the pane it belongs to.
+    selection: Option<Selection>,
+    /// Is the button still down on it? A wheel tick or a scroll during the drag
+    /// extends the selection instead of ending it.
+    selecting: bool,
     /// What a second `uncl` launched in the owner shell asked for (see
     /// `crate::app::control`). Filled in by the owner pane's parser, drained by
     /// the event loop as if it were the `Home` key.
@@ -261,6 +267,8 @@ impl Container {
             owner_scroll: 0,
             tenant_scroll: 0,
             link_press: None,
+            selection: None,
+            selecting: false,
             control,
         }
     }
@@ -445,6 +453,7 @@ impl Container {
             focused_scrolled,
             float_title: float_title.as_deref(),
             pinned: self.lease.tenant.pinned,
+            highlight: self.highlight(),
         });
 
         if !bytes.is_empty() {
@@ -504,6 +513,7 @@ impl Container {
         // reappear showing history nobody asked to see.
         self.tenant_scroll = 0;
         self.link_press = None;
+        self.drop_selection();
         self.refocus(self.float_focused());
         self.renderer.invalidate();
     }
@@ -519,6 +529,7 @@ impl Container {
         self.lease.tenant.child_grab = false;
         self.tenant_scroll = 0;
         self.link_press = None;
+        self.drop_selection();
         // Those pictures belong to a process that no longer exists.
         self.renderer.forget_images();
         // The keyboard goes back to the owner shell.
@@ -682,6 +693,231 @@ impl Container {
                 Err(_) => 0,
             }
         }
+    }
+
+    /// How far back a pane is scrolled (0 = live).
+    fn pane_scroll(&self, tenant: bool) -> usize {
+        if tenant {
+            self.tenant_scroll
+        } else {
+            self.owner_scroll
+        }
+    }
+
+    /// Where a press starts a selection: in the pane it landed in, and nowhere
+    /// else. Only ever called for a press the child declined — a TUI that asked
+    /// for the mouse keeps its drags, selection included.
+    fn start_selection(&mut self, tenant: bool, cell: (u16, u16)) {
+        self.selection = Some(Selection::new(tenant, cell, self.pane_scroll(tenant)));
+        self.selecting = true;
+    }
+
+    /// Forget the selection. Called by everything that makes it meaningless —
+    /// another press, a resize, the pane going away.
+    fn drop_selection(&mut self) {
+        self.selection = None;
+        self.selecting = false;
+    }
+
+    /// Extend or finish a drag selection, when one is in progress.
+    ///
+    /// Runs before either pane's routing, because while the button is down every
+    /// event belongs to the selection: the pointer leaving its pane (which must
+    /// not hand the drag to the other pane), a wheel tick (which scrolls that pane
+    /// and takes the moving end with it, instead of ending the selection) and the
+    /// release. `None` means the event was not the selection's to handle — a
+    /// press, or the release of one too short to be a drag — and goes on to the
+    /// normal routing, which is what keeps a click on a link working.
+    fn selection_mouse(&mut self, m: MouseEvent) -> Option<Flow> {
+        if !self.selecting {
+            return None;
+        }
+        let mut selection = self.selection?;
+        let tenant = selection.tenant;
+        let area = if tenant {
+            self.lease.tenant.content_rect()
+        } else {
+            self.rect
+        };
+
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                // A drag is not a click on a link.
+                self.link_press = None;
+                let cell = mouse::local_point(area, m.column, m.row);
+                selection.extend(cell, self.pane_scroll(tenant));
+
+                // Past an edge — or on the pane's own first or last line while the
+                // drag is going that way — the pane scrolls a line per event and the
+                // moving end stays on the edge. That is how a selection reaches
+                // back beyond the viewport, as far as the scrollback goes. The owner
+                // pane has no room above or below the screen for the pointer to
+                // escape into, so its edge lines do the job the float's border does
+                // for the float.
+                let above = m.row < area.y || cell.1 == 0;
+                let below = m.row >= area.bottom() || cell.1 + 1 >= area.height;
+                let wheel = if above && selection.focus.1 < selection.anchor.1 {
+                    Some(Wheel::Up)
+                } else if below && selection.focus.1 > selection.anchor.1 {
+                    Some(Wheel::Down)
+                } else {
+                    None
+                };
+                if let Some(wheel) = wheel {
+                    self.scroll(tenant, wheel, 1);
+                    let edge = match wheel {
+                        Wheel::Up => 0,
+                        Wheel::Down => area.height.saturating_sub(1),
+                    };
+                    selection.extend_row(edge, self.pane_scroll(tenant));
+                }
+            }
+
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let wheel = Wheel::from_kind(m.kind)?;
+                self.scroll(tenant, wheel, SCROLL_STEP);
+                let row = match wheel {
+                    Wheel::Up => 0,
+                    Wheel::Down => area.height.saturating_sub(1),
+                };
+                selection.extend_row(row, self.pane_scroll(tenant));
+            }
+
+            MouseEventKind::Up(_) => {
+                self.selecting = false;
+                // A press and release on one cell is a click, not a selection, so
+                // it clears the old one and is routed as the click it is.
+                if selection.is_drag() {
+                    self.selection = Some(selection);
+                } else {
+                    self.selection = None;
+                }
+                return None;
+            }
+
+            _ => return None,
+        }
+
+        self.selection = Some(selection);
+        Some(Flow::Redraw)
+    }
+
+    /// The selection as the frame wants it: rows of one pane, in *visible* rows.
+    ///
+    /// The conversion from document coordinates happens here, once per frame,
+    /// which is also where a scrolled pane clips a selection that reaches past its
+    /// view — the part that is off screen is not painted, but it is still there to
+    /// copy.
+    fn highlight(&self) -> Option<Highlight> {
+        let selection = self.selection?;
+        // A press that has not moved is not a selection yet: nothing to paint.
+        if !selection.is_drag() {
+            return None;
+        }
+        let area = if selection.tenant {
+            self.lease.tenant.content_rect()
+        } else {
+            self.rect
+        };
+        let rows = selection.visible(self.pane_scroll(selection.tenant), area.height, area.width);
+        (!rows.is_empty()).then_some(Highlight {
+            tenant: selection.tenant,
+            rows,
+        })
+    }
+
+    /// The selected text, one line per selected row.
+    ///
+    /// Read from a *clone* of the pane's screen: a row that is scrolled out of
+    /// view has to be brought back with `set_scrollback` before it can be read at
+    /// all, and that is a mutation of the snapshot, never of the parser.
+    fn selection_text(&self, selection: Selection) -> String {
+        let screen = if selection.tenant {
+            self.lease
+                .tenant_parser
+                .read()
+                .ok()
+                .map(|parser| parser.screen().clone())
+        } else {
+            self.parser.read().ok().map(|parser| parser.screen().clone())
+        };
+        let Some(mut screen) = screen else {
+            return String::new();
+        };
+
+        let cols = screen.size().1.get();
+        let height = screen.size().0.get();
+        let mut text = String::new();
+
+        for (row, from, to) in selection.lines(cols) {
+            // A negative row is history: scrolling back by exactly that much puts
+            // it on the top line, which is as close as it can be read from.
+            screen.set_scrollback(usize::try_from(-row).unwrap_or(0));
+            let visible = i32::try_from(screen.scrollback()).unwrap_or(0) + row;
+            let Ok(visible) = u16::try_from(visible) else {
+                continue;
+            };
+            if visible >= height {
+                continue;
+            }
+
+            // `contents_between` is `vt100`'s own answer to "the text under a
+            // selection": a wide character stays whole, and the blanks after the
+            // last one are not part of it.
+            text.push_str(&screen.contents_between(visible, from, visible, to));
+            // A soft-wrapped row is one long line, not two: copying should not
+            // invent a newline the child never printed.
+            if !screen.row_wrapped(visible) {
+                text.push('\n');
+            }
+        }
+
+        // The last row does not end the selection.
+        if text.ends_with('\n') {
+            text.truncate(text.len() - 1);
+        }
+        text
+    }
+
+    /// Copy the selection, if there is one. Returns whether `Ctrl+C` was consumed.
+    ///
+    /// Both routes are taken, because they cover different hosts: `OSC 52` is what
+    /// works over ssh and in a container (the clipboard is the host terminal's),
+    /// and the desktop programs are the ones to ask when the host has it disabled.
+    /// Whichever of them lands, the text is on the clipboard.
+    fn copy_selection(&mut self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let text = self.selection_text(selection);
+        if text.is_empty() {
+            // A click, or a row of blanks: `Ctrl+C` is the child's interrupt again.
+            return false;
+        }
+
+        // The desktop first: a program that owns the selection carries all of
+        // it, where `OSC 52` is capped by the host terminal and lands truncated.
+        let carried = clipboard::copy(&text);
+        if let Some(bytes) = clipboard::host_copy(&text, carried) {
+            let _ = self.host_tx.send(bytes);
+        }
+        true
+    }
+
+    /// Paste the system clipboard into the focused child. Returns whether the key
+    /// was consumed.
+    ///
+    /// Read here rather than through an `OSC 52` reply: uncl's input is
+    /// `crossterm`'s event stream, which drops a reply it cannot parse (see
+    /// `app::clipboard`). `forward_paste` adds the bracketed-paste markers when the
+    /// child asked for them.
+    fn paste(&mut self) -> bool {
+        let Some(bytes) = clipboard::read(b"c") else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        self.forward_paste(&text);
+        true
     }
 
     /// Back to the live view in both panes.
@@ -855,9 +1091,42 @@ impl Container {
             return Flow::Continue;
         }
 
+        // The selection's two chords, as they work in the terminal uncl runs in:
+        // `Ctrl+C` copies it and `Ctrl+V` pastes. This is the one place the
+        // selection is read, so it is read *before* the key gives it up below.
+        // Both fall through to the child when there is nothing for them to do —
+        // without a selection `Ctrl+C` is still an interrupt, and with no
+        // clipboard to read `Ctrl+V` is still `^V`.
+        let mut consumed = false;
+        if key.modifiers == KeyModifiers::CONTROL {
+            if matches!(key.code, KeyCode::Char('c' | 'C')) {
+                consumed = self.copy_selection();
+            }
+            if matches!(key.code, KeyCode::Char('v' | 'V')) && self.paste() {
+                consumed = true;
+            }
+        }
+
+        // Every key ends the selection, exactly as a click does. The highlight is
+        // a set of *document* rows, and once the view is back on the live screen
+        // those rows are whatever arrived after the drag: a highlight left behind
+        // paints fresh lines as though they had been selected. Taking it back is
+        // a repaint of the rows it covered — and only a *painted* selection has
+        // any, since one that never grew past the press is a click.
+        let dropped = self.selection.is_some_and(|selection| selection.is_drag());
+        self.drop_selection();
+        let repaint = move |flow: Flow| match flow {
+            Flow::Continue if dropped => Flow::Redraw,
+            flow => flow,
+        };
+
         // Typing means "I am done reading history": every shell in every terminal
         // behaves this way, and the key is still delivered to the child below.
         self.reset_scroll();
+
+        if consumed {
+            return Flow::Redraw;
+        }
 
         // Escape hatch: Ctrl+Alt+q quits uncl without having to type `exit`
         // into whichever shell happens to have focus.
@@ -908,7 +1177,7 @@ impl Container {
         }
 
         let Some(sender) = self.active_sender() else {
-            return Flow::Continue;
+            return repaint(Flow::Continue);
         };
         let modes = self.focused_modes();
 
@@ -916,7 +1185,7 @@ impl Container {
             let _ = sender.send(Bytes::from(bytes));
         }
 
-        Flow::Continue
+        repaint(Flow::Continue)
     }
 
     /// Route one mouse event: float geometry, child input, or click-away.
@@ -948,6 +1217,18 @@ impl Container {
         }
         let focus_changed = was_focused != self.lease.tenant_focused;
 
+        // A selection is lost by clicking anywhere, exactly as in the terminal uncl
+        // runs in: the press that starts a new one sets it again below, and every
+        // other press — on the border, on the other pane, outside the float, with
+        // another button — just ends it. Taking the highlight back is a repaint.
+        // Only a *painted* selection needs the repaint: one that never grew past
+        // the press is a click, and has never been drawn.
+        let dropped = matches!(m.kind, MouseEventKind::Down(_))
+            && self.selection.is_some_and(|selection| selection.is_drag());
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.drop_selection();
+        }
+
         match mouse::route(&self.lease.tenant, m) {
             MouseRoute::Child { col, row } => {
                 let content = self.lease.tenant.content_rect();
@@ -967,6 +1248,11 @@ impl Container {
                         self.scroll(true, wheel, SCROLL_STEP);
                         return Flow::Redraw;
                     }
+                    // The child declined the press, so the drag is uncl's: select
+                    // this pane's text, and only this pane's.
+                    if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                        self.start_selection(true, (col, row));
+                    }
                     self.link_click(true, m.kind, (col, row));
                 }
 
@@ -978,7 +1264,7 @@ impl Container {
                     _ => {}
                 }
 
-                if focus_changed {
+                if focus_changed || dropped {
                     Flow::Redraw
                 } else {
                     Flow::Continue
@@ -1072,6 +1358,14 @@ impl Container {
 
     /// Mouse events for the background shell, encoded in *its* protocol.
     fn forward_owner_mouse(&mut self, m: MouseEvent) -> Flow {
+        // The press that starts a selection here clears the old one, like every
+        // other press does; taking the highlight back is a repaint of its rows.
+        let dropped = matches!(m.kind, MouseEventKind::Down(_))
+            && self.selection.is_some_and(|selection| selection.is_drag());
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.drop_selection();
+        }
+
         let (modes, area) = {
             let parser = self.parser.read().unwrap();
             (ChildModes::from_screen(parser.screen()), self.rect)
@@ -1090,7 +1384,11 @@ impl Container {
             if let Some(session) = &self.session {
                 let _ = session.writer.send(Bytes::from(bytes));
             }
-            return Flow::Continue;
+            return if dropped {
+                Flow::Redraw
+            } else {
+                Flow::Continue
+            };
         }
 
         if let Some(wheel) = Wheel::from_kind(m.kind) {
@@ -1098,20 +1396,27 @@ impl Container {
             return Flow::Redraw;
         }
 
-        // The owner's grid starts at the screen origin, but the subtraction is what
+        // The owner's grid starts at the screen origin, but the conversion is what
         // keeps this honest if that ever stops being true.
-        let cell = (
-            m.column.saturating_sub(area.x),
-            m.row.saturating_sub(area.y),
-        );
+        let cell = mouse::local_point(area, m.column, m.row);
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.start_selection(false, cell);
+        }
         self.link_click(false, m.kind, cell);
-        Flow::Continue
+        if dropped {
+            Flow::Redraw
+        } else {
+            Flow::Continue
+        }
     }
 
     fn handle_event(&mut self, event: Event) -> Flow {
         match event {
             Event::Key(key) => self.handle_key(key),
-            Event::Mouse(m) => self.handle_mouse(m),
+            Event::Mouse(m) => match self.selection_mouse(m) {
+                Some(flow) => flow,
+                None => self.handle_mouse(m),
+            },
             Event::Paste(text) => {
                 self.forward_paste(&text);
                 Flow::Continue
@@ -1135,6 +1440,10 @@ impl Container {
                 if let Some(session) = &self.session {
                     let _ = session.resize.send((rows, cols));
                 }
+
+                // Every column moved, so a selection no longer points at the text
+                // it was dragged over.
+                self.drop_selection();
 
                 // Keep the float on screen and take the child's grid with it.
                 self.lease.tenant.clamp_to((cols, rows));
@@ -1343,7 +1652,206 @@ fn open_url(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A container whose owner pane is the only thing on screen, `rows` x `cols`,
+    /// with `lines` lines of output already in it.
+    fn owner_pane(rows: u16, cols: u16, lines: &[&str]) -> Container {
+        let mut container = Container::new(true);
+        container.size = Size { cols, rows };
+        container.rect = Rect::new(0, 0, cols, rows);
+        let mut parser = container.parser.write().unwrap();
+        parser.set_size(nz(rows), nz(cols));
+        for line in lines {
+            parser.process(line.as_bytes());
+            parser.process(b"\r\n");
+        }
+        drop(parser);
+        container
+    }
+
+    #[test]
+    fn a_drag_over_the_owner_pane_selects_the_text_it_covers() {
+        let mut container = owner_pane(4, 10, &["alpha", "bravo", "charlie"]);
+
+        let press = container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        assert_eq!(press, Flow::Continue);
+        container.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            2,
+        )));
+
+        let selection = container.selection.expect("a drag selects");
+        assert!(!selection.tenant, "the press was in the owner pane");
+        assert_eq!(container.selection_text(selection), "lpha\nbravo\nchar");
+
+        // The highlight is the three rows it covers, in *visible* rows.
+        let highlight = container.highlight().expect("a drag is painted");
+        assert_eq!(
+            highlight.rows,
+            [(0, 1, 10), (1, 0, 10), (2, 0, 4)]
+        );
+    }
+
+    #[test]
+    fn a_click_leaves_no_selection_behind() {
+        let mut container = owner_pane(4, 10, &["alpha"]);
+
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        container.handle_event(Event::Mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)));
+
+        assert_eq!(container.selection, None);
+        assert_eq!(container.highlight(), None);
+    }
+
+    #[test]
+    fn copying_gives_the_selection_up() {
+        let mut container = owner_pane(4, 10, &["alpha", "bravo", "charlie"]);
+
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        container.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            2,
+        )));
+        assert!(container.highlight().is_some(), "a drag is painted");
+
+        let flow = container.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+
+        assert_eq!(flow, Flow::Redraw, "Ctrl+C is the selection's to consume");
+        assert_eq!(container.selection, None, "copying ends the selection");
+        assert_eq!(container.highlight(), None, "and takes the highlight back");
+    }
+
+    #[test]
+    fn a_key_press_ends_a_selection_left_in_the_scrollback() {
+        let lines: Vec<String> = (0..40).map(|line| format!("line{line:02}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut container = owner_pane(4, 10, &lines);
+
+        // Park the view in the history and select there: those rows are *history*,
+        // and a highlight left behind once the view goes back to live would be
+        // sitting on whatever arrives next.
+        container.handle_event(Event::Mouse(mouse(MouseEventKind::ScrollUp, 3, 1)));
+        assert!(container.pane_scroll(false) > 0, "scrolled back");
+
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        container.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            2,
+        )));
+        assert!(container.highlight().is_some(), "a drag is painted");
+
+        let flow =
+            container.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+
+        assert_eq!(flow, Flow::Redraw, "the rows it covered are painted back");
+        assert_eq!(container.selection, None, "any key ends the selection");
+        assert_eq!(container.highlight(), None);
+        assert_eq!(
+            container.pane_scroll(false),
+            0,
+            "and the view is back on the live screen"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_reaches_into_the_scrollback_is_copied_whole() {
+        let lines: Vec<String> = (0..300).map(|line| format!("line{line:03}")).collect();
+        let mut container = Container::new(true);
+        container.size = Size {
+            cols: 12,
+            rows: 6,
+        };
+        container.rect = Rect::new(0, 0, 12, 6);
+        {
+            let mut parser = container.parser.write().unwrap();
+            parser.set_size(nz(6), nz(12));
+            for (index, line) in lines.iter().enumerate() {
+                parser.process(line.as_bytes());
+                if index + 1 < lines.len() {
+                    parser.process(b"\r\n");
+                }
+            }
+        }
+
+        // Press at the end of the last line and drag up to the first, then keep
+        // dragging: each event at the edge scrolls the pane one line further back.
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 11, 5));
+        for _ in 0..100 {
+            container.handle_event(Event::Mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                0,
+            )));
+        }
+
+        assert_eq!(container.pane_scroll(false), 100, "one line per event");
+        let selection = container.selection.expect("a selection");
+        let text = container.selection_text(selection);
+        let copied: Vec<&str> = text.lines().collect();
+        assert_eq!(copied.len(), 106, "text: {text:?}");
+        assert_eq!(copied[0], "line194", "the whole selection: {text:?}");
+        assert_eq!(copied[105], "line299", "the whole selection: {text:?}");
+        assert_eq!(text.len(), 106 * 7 + 105, "every row in full");
+    }
+
+    #[test]
+    fn a_drag_to_the_top_line_scrolls_the_pane_and_keeps_the_selection() {
+        let lines: Vec<String> = (0..9).map(|line| format!("line{line}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut container = owner_pane(4, 10, &lines);
+
+        // The press is on the last visible line, and the drag goes up to the top
+        // line. With nowhere above the screen for the pointer to escape into, the
+        // top line itself is what scrolls.
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 3));
+        container.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            0,
+        )));
+
+        assert_eq!(container.pane_scroll(false), 1, "one line back");
+        let selection = container.selection.expect("the drag is still a selection");
+        assert_eq!(selection.anchor, (0, 3));
+        assert_eq!(selection.focus, (0, -1), "the moving end stayed on the edge");
+
+        // The line the scroll uncovered is part of the selection, and it is the one
+        // that was above the pane before the drag: the selection now reaches into
+        // history, which is the whole point of scrolling during a drag.
+        let text = container.selection_text(selection);
+        assert_eq!(text.lines().count(), 4, "text: {text:?}");
+        assert!(text.starts_with("line"), "text: {text:?}");
+        assert!(text.contains("line7"), "text: {text:?}");
+    }
+
+    #[test]
+    fn the_wheel_during_a_drag_scrolls_instead_of_ending_the_selection() {
+        let mut container = owner_pane(4, 10, &["alpha", "bravo", "charlie"]);
+
+        container.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 3));
+        container.handle_event(Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 2)));
+        container.handle_event(Event::Mouse(mouse(MouseEventKind::ScrollUp, 2, 2)));
+
+        assert!(container.selecting, "the button is still down");
+        let selection = container.selection.expect("a selection");
+        assert!(selection.is_drag());
+    }
 
     #[test]
     fn clicking_inside_inactive_pinned_tenant_restores_focus_and_redraws() {
