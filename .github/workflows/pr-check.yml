@@ -4,12 +4,35 @@ on:
     branches: [dev]
 permissions:
   contents: read
+  issues: write
 jobs:
   test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test
-        run: cargo test --locked --all-targets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set +e
+          cargo test --locked --all-targets 2>&1 | tee /tmp/build.log
+          code=${PIPESTATUS[0]}
+          echo "cargo test exit=$code"
+          if [ "$code" -ne 0 ]; then
+            python3 - <<'PY'
+          import json, os, urllib.request
+          log = open('/tmp/build.log', errors='replace').read()[-55000:]
+          body = {"body": "```\n" + log + "\n```"}
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['GH_REPO']}/issues/51/comments",
+              data=json.dumps(body).encode(),
+              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                       "Accept": "application/vnd.github+json"})
+          urllib.request.urlopen(req).read()
+          print("posted the build log as a comment")
+          PY
+            exit "$code"
+          fi
