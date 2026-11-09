@@ -132,7 +132,6 @@ fn frame_for(renderer: &mut Renderer, screen: &vt100::Screen) -> Vec<u8> {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec()
 }
@@ -283,7 +282,6 @@ fn a_resize_repaints_and_the_result_replays() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
     assert!(!frame.is_empty(), "a resize must repaint");
@@ -349,7 +347,6 @@ fn a_float_replays_over_the_owner_grid() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
     assert!(!frame.is_empty());
@@ -444,7 +441,6 @@ fn a_status_bar_does_not_bleed_into_the_border() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
     assert!(!frame.is_empty());
@@ -502,7 +498,6 @@ fn an_empty_owner_tail_is_repaired_too() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
     assert!(!frame.is_empty());
@@ -553,7 +548,6 @@ fn a_linked_row_replays_to_the_same_cells() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
 
@@ -613,7 +607,6 @@ fn an_image_does_not_disturb_the_grid() {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
-            selection: None,
         })
         .to_vec();
 
@@ -683,7 +676,6 @@ fn a_resize_that_changes_nothing_paints_nothing_until_it_is_invalidated() {
                 focused_scrolled: false,
                 float_title: None,
                 pinned: false,
-                selection: None,
             })
             .to_vec()
     };
