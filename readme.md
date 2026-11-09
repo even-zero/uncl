@@ -32,7 +32,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - images render inside the float
 - clickable links inside the float
 - scrollback in both panes
-- mouse support in both panes
+- mouse support in both panes, text selection with `Ctrl+C`/`Ctrl+V`
 - copy and paste (`OSC 52`)
 - children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
   `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
@@ -78,14 +78,21 @@ launched in:
 
 uncl keeps the mouse while it runs: that is how the float is dragged and resized
 with it, how a click outside hides it, how the wheel reaches either pane's
-history, and how a click resolves a link. keeping it also means your terminal
-emulator never selects anything itself - it never sees a drag, so its own
-selection and scrollback cannot happen inside uncl.
+history, and how a click resolves a link.
 
-`UNCL_MOUSE=0 uncl` gives the mouse back. uncl then asks for nothing, and your
-terminal's own selection, copy and paste work exactly as they do outside uncl,
-in both panes, while uncl's mouse gestures rest: `[Home]` still toggles,
-`Alt`+arrows still move and resize, `Ctrl+Alt`+arrows still scroll.
+dragging over a pane's text selects it, in that pane only. the selection is
+anchored to the text and not to the screen: dragging past the top or bottom edge
+scrolls that pane and keeps going, as far back as its scrollback reaches, and
+scrolling afterwards moves the highlight along with the lines it covers. clicking
+anywhere - in it, outside it, in the other pane - drops it. `Ctrl+C` copies it
+and `Ctrl+V` pastes; with nothing selected `Ctrl+C` is the shell's interrupt
+again. the copy goes to your terminal over `OSC 52` and, where they exist, through
+`wl-copy`/`xclip`/`xsel`/`pbcopy`. a TUI that asked for the mouse keeps its own
+drags, selection included - the child always comes first.
+
+`UNCL_MOUSE=0 uncl` gives the mouse back instead: uncl asks for nothing, and your
+terminal's own selection, copy and paste work exactly as they do outside uncl, at
+the price of the gestures above.
 
 ## installing
 

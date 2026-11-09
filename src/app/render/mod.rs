@@ -61,6 +61,10 @@ const BORDER_COLOR_INACTIVE: &[u8] = b"\x1b[90m";
 /// and this glyph is three bytes on the wire, like every other one here.
 const PIN_BOX: &str = "■";
 const BORDER_VERTICAL: &str = "│";
+/// Reverse video, for the selected part of a row: the one style uncl adds to a
+/// child's own cells.
+const SELECTED_ON: &[u8] = b"\x1b[7m";
+const SELECTED_OFF: &[u8] = b"\x1b[27m";
 /// kitty: delete every placement (not the image data). Sent when the float goes
 /// away, because kitty images live in a layer that our own repaint cannot touch.
 const KITTY_DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A\x1b\\";
@@ -93,6 +97,33 @@ pub struct Panes<'a> {
     pub float_title: Option<&'a str>,
     /// Is the float pinned? Its top-right corner shows `[■]` instead of `[ ]`.
     pub pinned: bool,
+    /// The drag selection, already translated into the pane's own visible rows.
+    pub highlight: Option<Highlight>,
+}
+
+/// The selected rows of one pane, in that pane's **visible** grid.
+///
+/// The selection itself is kept in document coordinates (`mouse::Selection`), so
+/// the caller converts it once per frame — which is also where a pane scrolled
+/// back past a selection's end clips it. Rows are spelled out one by one rather
+/// than as a rectangle, so the renderer needs no scrollback knowledge and no
+/// arithmetic: it looks a row up and reverses the columns it finds.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Highlight {
+    /// The float, or the shell behind it. One pane only, ever.
+    pub tenant: bool,
+    /// `(row, from, to)` per selected row, `to` exclusive.
+    pub rows: Vec<(u16, u16, u16)>,
+}
+
+impl Highlight {
+    /// The columns selected on `row`, if it is one of them.
+    fn span(&self, row: u16) -> Option<(u16, u16)> {
+        self.rows
+            .iter()
+            .find(|(selected, _, _)| *selected == row)
+            .map(|(_, from, to)| (*from, *to))
+    }
 }
 
 /// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
@@ -133,6 +164,10 @@ pub struct Renderer {
     title: Option<String>,
     /// Whether the float was drawn with the inactive pinned border color.
     inactive_pinned: bool,
+    /// The highlight the last frame was painted with, so a change repaints the
+    /// rows it left behind: reverse video is not part of a cell, and the diff
+    /// cannot see it.
+    highlight: Option<Highlight>,
 }
 
 impl Renderer {
@@ -153,6 +188,7 @@ impl Renderer {
             scroll: 0,
             title: None,
             inactive_pinned: false,
+            highlight: None,
         }
     }
 
@@ -195,6 +231,7 @@ impl Renderer {
             focused_scrolled,
             float_title,
             pinned,
+            highlight,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
@@ -235,6 +272,18 @@ impl Renderer {
             }
         }
 
+        // A highlight is not part of a cell, so the diff cannot see it: whichever
+        // rows it was painted on and whichever rows it is painted on now are
+        // repainted whole, in the pane it belongs to. One comparison, and no cost
+        // at all while there is no selection.
+        let stale = highlight_rows(self.highlight.as_ref(), highlight.as_ref());
+        self.highlight = highlight;
+        for row in &stale.0 {
+            if !owner_rows.contains(row) {
+                owner_rows.push(*row);
+            }
+        }
+
         let (float_plan, borders) = match float_at {
             Some((screen, rect)) => {
                 let plan = plan_float(
@@ -261,6 +310,14 @@ impl Renderer {
             None => (Vec::new(), false),
         };
 
+        // The same for the float: a row that gained or lost its highlight is
+        // painted whole, whether or not its cells changed. Nothing to do while the
+        // float is away, since a hidden pane paints no rows at all.
+        let mut float_plan = float_plan;
+        if float_at.is_some() {
+            force_rows(&mut float_plan, &stale.1);
+        }
+
         if !owner_rows.is_empty() || !float_plan.is_empty() || borders {
             self.begin_paint();
         }
@@ -274,6 +331,7 @@ impl Renderer {
                 &owner_rows,
                 owner_full,
                 &links.owner,
+                self.highlight.as_ref().filter(|selection| !selection.tenant),
             );
         }
 
@@ -293,6 +351,7 @@ impl Renderer {
                 float_title,
                 pinned,
                 border_color,
+                self.highlight.as_ref().filter(|selection| selection.tenant),
             );
         }
 
@@ -499,6 +558,39 @@ fn dirty_rows(cur: &Screen, prev: Option<&Screen>, area: Rect, full: bool) -> Ve
     rows
 }
 
+/// The rows a highlight change has to repaint, per pane: `(owner, float)`.
+///
+/// Both the rows the old highlight covered and the rows the new one covers, since
+/// a row that lost its selection has to be painted back the way it was. While a
+/// selection is dragged this is a handful of rows; with no selection at all it is
+/// two empty vectors.
+fn highlight_rows(old: Option<&Highlight>, new: Option<&Highlight>) -> (Vec<u16>, Vec<u16>) {
+    let mut stale: (Vec<u16>, Vec<u16>) = (Vec::new(), Vec::new());
+    for highlight in [old, new].into_iter().flatten() {
+        let rows = if highlight.tenant {
+            &mut stale.1
+        } else {
+            &mut stale.0
+        };
+        for (row, _, _) in &highlight.rows {
+            if !rows.contains(row) {
+                rows.push(*row);
+            }
+        }
+    }
+    stale
+}
+
+/// Make sure these rows of the float are painted whole, on top of the diff plan.
+fn force_rows(plan: &mut Vec<FloatRow>, rows: &[u16]) {
+    for row in rows {
+        match plan.iter_mut().find(|entry| entry.row() == *row) {
+            Some(entry) => *entry = FloatRow::Full(*row),
+            None => plan.push(FloatRow::Full(*row)),
+        }
+    }
+}
+
 /// How one float row has to be painted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FloatRow {
@@ -508,6 +600,14 @@ enum FloatRow {
     Diff(u16),
     /// The whole row: the float is new, or the owner painted over it.
     Full(u16),
+}
+
+impl FloatRow {
+    fn row(self) -> u16 {
+        match self {
+            FloatRow::Diff(row) | FloatRow::Full(row) => row,
+        }
+    }
 }
 
 fn plan_float(
@@ -560,6 +660,7 @@ fn emit_owner_rows(
     rows: &[u16],
     full: bool,
     links: &Links,
+    highlight: Option<&Highlight>,
 ) {
     let width = area.width;
 
@@ -574,10 +675,16 @@ fn emit_owner_rows(
             cup(out, area.y.saturating_add(row), area.x);
             reset(out);
             erase_chars(out, width);
-            if links.covers(cur, row) {
-                emit_row_segments(out, cur, links, row, area.y, area.x, width);
-            } else {
-                append_row(out, &text, area.y, area.x);
+            match (highlight.and_then(|highlight| highlight.span(row)), links.covers(cur, row)) {
+                (Some(span), _) => {
+                    emit_selected_row(out, cur, row, area.y, area.x, width, span);
+                }
+                (None, true) => {
+                    emit_row_segments(out, cur, links, row, area.y, area.x, width);
+                }
+                (None, false) => {
+                    append_row(out, &text, area.y, area.x);
+                }
             }
         }
         return;
@@ -587,6 +694,16 @@ fn emit_owner_rows(
     for (row, text) in cur.rows_diff(prev, 0, width).enumerate() {
         let row = row as u16;
         if !rows.contains(&row) {
+            continue;
+        }
+
+        // A selected row is painted whole, for the same reason a hyperlink is:
+        // a diff is a sparse set of cells and has no span to reverse.
+        if let Some(span) = highlight.and_then(|highlight| highlight.span(row)) {
+            cup(out, area.y.saturating_add(row), area.x);
+            reset(out);
+            erase_chars(out, width);
+            emit_selected_row(out, cur, row, area.y, area.x, width, span);
             continue;
         }
 
@@ -625,6 +742,7 @@ fn emit_float(
     title: Option<&str>,
     pinned: bool,
     border_color: &[u8],
+    highlight: Option<&Highlight>,
 ) {
     let width = content.width;
 
@@ -657,6 +775,7 @@ fn emit_float(
                         false,
                         links,
                         border_color,
+                        highlight,
                     );
                 }
             }
@@ -677,6 +796,7 @@ fn emit_float(
                     true,
                     links,
                     border_color,
+                    highlight,
                 );
             }
         }
@@ -757,24 +877,29 @@ fn emit_float_row(
     blank_first: bool,
     links: &Links,
     border_color: &[u8],
+    highlight: Option<&Highlight>,
 ) {
     let screen_row = content.y.saturating_add(row);
+    let selected = highlight.and_then(|highlight| highlight.span(row));
 
     cup(out, screen_row, rect.x);
     border_text(out, BORDER_VERTICAL, border_color);
 
     cup(out, screen_row, content.x);
     reset(out);
-    if blank_first {
+    if blank_first || selected.is_some() {
         // Bounded to the float's width, so it can never reach the border or the
         // owner pane. Needed only when the cells are not known to be the ones we
-        // last painted.
+        // last painted — and always for a selected row, whose reverse video has to
+        // be able to go away again.
         erase_chars(out, content.width);
     }
-    let erased = if links.covers(cur, row) {
-        emit_row_segments(out, cur, links, row, content.y, content.x, content.width)
-    } else {
-        append_row(out, text, content.y, content.x)
+    let erased = match selected {
+        Some(span) => emit_selected_row(out, cur, row, content.y, content.x, content.width, span),
+        None if links.covers(cur, row) => {
+            emit_row_segments(out, cur, links, row, content.y, content.x, content.width)
+        }
+        None => append_row(out, text, content.y, content.x),
     };
 
     // After the row: an `EL` inside it would have erased the border cell, and
@@ -786,6 +911,72 @@ fn emit_float_row(
     if erased {
         repair_tail(out, owner, screen_row, rect, owner_area);
     }
+}
+
+/// Paint one row with the selected columns reversed.
+///
+/// Written as up to three pieces — before, the selection, after — because the
+/// span's columns are known while a byte offset *inside* `vt100`'s encoded row is
+/// not. Reverse video is the only style uncl adds: the child's own colours stay in
+/// the selected cells, so a selection reads as a selection rather than as a
+/// repaint.
+///
+/// Returns whether any piece ended with `EL`, which the float's caller has to
+/// repair beyond the border, exactly as for a hyperlinked row.
+fn emit_selected_row(
+    out: &mut Vec<u8>,
+    screen: &Screen,
+    row: u16,
+    origin_y: u16,
+    origin_x: u16,
+    width: u16,
+    span: (u16, u16),
+) -> bool {
+    let from = span.0.min(width);
+    let to = span.1.min(width);
+    let mut erased = false;
+
+    for (start, end, selected) in [(0, from, false), (from, to, true), (to, width, false)] {
+        if end <= start {
+            continue;
+        }
+        let Some(text) = screen.rows_formatted(start, end - start).nth(usize::from(row)) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+
+        cup(out, origin_y.saturating_add(row), origin_x.saturating_add(start));
+        reset(out);
+        if selected {
+            out.extend_from_slice(SELECTED_ON);
+        }
+        // Absolute moves inside the text are pane-local, so only the pane's
+        // origin is added; the piece's own column was set by the `CUP` above.
+        erased |= append_row(out, &selected_text(&text, selected), origin_y, origin_x);
+        if selected {
+            out.extend_from_slice(SELECTED_OFF);
+        }
+    }
+
+    erased
+}
+
+/// A selected piece with its reverse video re-asserted after every `SGR 0`.
+///
+/// `vt100` writes a bare reset whenever the cell it is about to paint is plain,
+/// which would switch the reverse video off in the middle of the span: every cell
+/// that is not styled would paint itself unselected. Re-asserting right after each
+/// reset is the whole fix, and it costs nothing on a piece that has none.
+fn selected_text(text: &str, selected: bool) -> std::borrow::Cow<'_, str> {
+    if !selected {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.replace("\x1b[m", "\x1b[m\x1b[7m")
+            .replace("\x1b[0m", "\x1b[0m\x1b[7m"),
+    )
 }
 
 /// Paint one row in segments, wrapping each hyperlinked span in `OSC 8`.
@@ -1278,6 +1469,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         let frame = text(frame);
@@ -1285,6 +1477,125 @@ mod tests {
         assert!(frame.contains("hello"), "frame: {frame:?}");
         assert!(frame.contains("\x1b[1;1H"), "frame: {frame:?}");
         assert!(frame.ends_with("\x1b[?25h"), "frame: {frame:?}");
+    }
+
+    /// One owner frame with `highlight` on the first row, of a 4x20 screen.
+    fn highlighted_frame(renderer: &mut Renderer, screen: &vt100::Screen, highlight: Option<Highlight>) -> String {
+        let frame = renderer.render(Panes {
+            owner: screen.clone(),
+            owner_area: Rect::new(0, 0, 20, 4),
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+            pinned: false,
+            highlight,
+        });
+        text(frame)
+    }
+
+    #[test]
+    fn a_selected_row_is_painted_reversed_and_nothing_else_is() {
+        let mut parser = parser(4, 20);
+        parser.process(b"hello");
+        let screen = parser.screen().clone();
+
+        let mut renderer = Renderer::new();
+        let frame = highlighted_frame(
+            &mut renderer,
+            &screen,
+            Some(Highlight {
+                tenant: false,
+                rows: vec![(0, 1, 4)],
+            }),
+        );
+
+        // `ell` is reversed, `h` and `lo` are not: the selection is the span, not
+        // the row.
+        let reversed = frame
+            .split("\x1b[7m")
+            .nth(1)
+            .expect("a reversed span");
+        let (inside, after) = reversed.split_once("\x1b[27m").expect("reverse turned off again");
+        assert!(inside.ends_with("ell"), "reversed: {inside:?}\nframe: {frame:?}");
+        assert!(after.contains("lo"), "after: {after:?}\nframe: {frame:?}");
+        assert_eq!(frame.matches("\x1b[7m").count(), 1, "one span only: {frame:?}");
+    }
+
+    #[test]
+    fn a_plain_cell_in_the_middle_of_a_selection_stays_selected() {
+        // `vt100` writes a bare `SGR 0` before a plain cell, which would switch the
+        // reverse video off halfway through a span of one styled cell and one plain
+        // one.
+        let mut parser = parser(4, 20);
+        parser.process(b"\x1b[31mred\x1b[m plain");
+        let screen = parser.screen().clone();
+
+        let mut renderer = Renderer::new();
+        let frame = highlighted_frame(
+            &mut renderer,
+            &screen,
+            Some(Highlight {
+                tenant: false,
+                rows: vec![(0, 0, 9)],
+            }),
+        );
+
+        let reversed = frame.split("\x1b[7m").nth(1).expect("a reversed span");
+        let (inside, _) = reversed.split_once("\x1b[27m").expect("reverse turned off again");
+        assert!(inside.contains("red"), "frame: {frame:?}");
+        assert!(inside.contains("plain"), "frame: {frame:?}");
+        // Every reset inside the span puts the reverse video back.
+        assert!(
+            !inside.contains("\x1b[m\x1b[31m"),
+            "a reset without reverse behind it: {inside:?}"
+        );
+    }
+
+    #[test]
+    fn giving_up_a_selection_repaints_the_rows_it_covered() {
+        let mut parser = parser(4, 20);
+        parser.process(b"hello");
+        let screen = parser.screen().clone();
+
+        let mut renderer = Renderer::new();
+        let highlight = Highlight {
+            tenant: false,
+            rows: vec![(0, 1, 4)],
+        };
+        let selected = highlighted_frame(&mut renderer, &screen, Some(highlight.clone()));
+        assert!(selected.contains("\x1b[7m"), "frame: {selected:?}");
+
+        // The same screen, with the selection gone: nothing changed in the grid, so
+        // the row would cost nothing — but its reverse video has to be taken back.
+        let cleared = highlighted_frame(&mut renderer, &screen, None);
+        assert!(cleared.contains("\x1b[1;1H"), "row 0 repainted: {cleared:?}");
+        assert!(!cleared.contains("\x1b[7m"), "frame: {cleared:?}");
+        assert!(cleared.contains("hello"), "frame: {cleared:?}");
+
+        // And once it has been taken back, an unchanged screen is free again.
+        assert!(highlighted_frame(&mut renderer, &screen, None).is_empty());
+    }
+
+    #[test]
+    fn a_selection_in_the_float_does_not_touch_the_owner_pane() {
+        let mut parser = parser(4, 20);
+        parser.process(b"hello");
+        let screen = parser.screen().clone();
+
+        let mut renderer = Renderer::new();
+        let frame = highlighted_frame(
+            &mut renderer,
+            &screen,
+            Some(Highlight {
+                tenant: true,
+                rows: vec![(0, 0, 5)],
+            }),
+        );
+        assert!(!frame.contains("\x1b[7m"), "frame: {frame:?}");
     }
 
     #[test]
@@ -1305,6 +1616,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         let second = renderer.render(Panes {
@@ -1318,6 +1630,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
         assert!(second.is_empty(), "second frame: {:?}", text(second));
     }
@@ -1340,6 +1653,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         parser.process(b"\r\nchanged");
@@ -1354,6 +1668,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("changed"), "frame: {frame:?}");
@@ -1381,6 +1696,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("floating"), "frame: {frame:?}");
@@ -1410,6 +1726,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
         // The float disappearing is a repaint, but the owner's cells are intact.
         let frame = text(renderer.render(Panes {
@@ -1423,6 +1740,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(frame.is_empty(), "frame: {frame:?}");
     }
@@ -1445,6 +1763,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("\x1b[?25l"), "frame: {frame:?}");
@@ -1480,6 +1799,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         let el_at = frame.find("\x1b[K").expect("the float row should erase");
@@ -1535,6 +1855,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         // Every right-hand border cell is addressed on a clean pen: reset, then
@@ -1571,6 +1892,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         };
 
         let mut renderer = Renderer::new();
@@ -1599,6 +1921,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         };
 
         let mut renderer = Renderer::new();
@@ -1632,6 +1955,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         // Nothing changed, so nothing is painted…
@@ -1646,6 +1970,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
         assert!(quiet.is_empty());
 
@@ -1662,6 +1987,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("owner"), "frame: {frame:?}");
@@ -1706,6 +2032,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         let row_at = frame.find("hi").expect("the float row is painted");
@@ -1743,6 +2070,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         let second = renderer.render(Panes {
@@ -1756,6 +2084,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
         assert!(second.is_empty(), "frame: {:?}", text(second));
     }
@@ -1782,6 +2111,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         // The float moved: same image, one line of placement, no payload.
@@ -1798,6 +2128,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("\x1b_Ga=p,i=7\x1b\\"), "frame: {frame:?}");
@@ -1829,6 +2160,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         // `Home`: the kitty image lives in a layer our repaint cannot reach.
@@ -1844,6 +2176,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(hidden.contains("\x1b_Ga=d,d=A\x1b\\"), "frame: {hidden:?}");
 
@@ -1860,6 +2193,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(shown.contains("QUJD"), "frame: {shown:?}");
     }
@@ -1885,6 +2219,7 @@ mod tests {
                 focused_scrolled: false,
                 float_title: title,
                 pinned: false,
+                highlight: None,
             }))
         };
 
@@ -2031,6 +2366,7 @@ mod tests {
                 focused_scrolled: scroll > 0,
                 float_title: None,
                 pinned: false,
+                highlight: None,
             }))
         };
 
@@ -2076,6 +2412,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         // Text painted over sixel destroys it, so any repaint has to be followed
@@ -2092,6 +2429,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(frame.contains("more"), "frame: {frame:?}");
         assert!(frame.contains("\x1bPq"), "frame: {frame:?}");
@@ -2124,6 +2462,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(!frame.contains("QUJD"), "frame: {frame:?}");
     }
@@ -2190,6 +2529,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         assert!(frame.contains("1337;File="), "frame: {frame:?}");
@@ -2235,6 +2575,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         let open = frame.find("\x1b]8;;https://example.com\x1b\\");
@@ -2280,6 +2621,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         });
 
         // The cells do not change; only the link is added. A diff would show
@@ -2305,6 +2647,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(
             frame.contains("\x1b]8;;https://example.com\x1b\\"),
@@ -2338,6 +2681,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(
             !frame.contains("\x1b]8;"),
@@ -2369,6 +2713,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
 
         let open = frame.find("\x1b]8;;file:///tmp\x1b\\").expect("opened");
@@ -2423,6 +2768,7 @@ mod tests {
             focused_scrolled: true,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(frame.contains(&oldest), "frame: {frame:?}");
         assert!(!frame.contains("line9"), "frame: {frame:?}");
@@ -2449,6 +2795,7 @@ mod tests {
             focused_scrolled: scroll > 0,
             float_title: None,
             pinned: false,
+            highlight: None,
         };
 
         // The live screen first, in full: the newest line is on it.
@@ -2471,6 +2818,7 @@ mod tests {
             focused_scrolled: true,
             float_title: None,
             pinned: false,
+            highlight: None,
         }));
         assert!(!back.is_empty(), "scrolling must repaint");
 
@@ -2505,6 +2853,7 @@ mod tests {
                 focused_scrolled: scroll > 0,
                 float_title: None,
                 pinned: false,
+                highlight: None,
             }))
         };
 
