@@ -31,9 +31,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use vt100::{MouseProtocolMode, Screen};
 
+use crate::app::clipboard;
 use crate::app::control::Control;
 use crate::app::input::encode::{ChildModes, encode_key, encode_mouse};
-use crate::app::input::mouse::{self, MouseRoute, Wheel};
+use crate::app::input::mouse::{self, MouseRoute, Selection, Wheel};
 use crate::app::lease::{Lease, new_parser};
 use crate::app::pty::{self, ChildParser, PtySession};
 use crate::app::state::{load_tenant_geometry, save_tenant_geometry};
@@ -41,7 +42,7 @@ use crate::app::term::callbacks::ChildState;
 use crate::app::term::dcs;
 use crate::app::signal::Signal;
 use crate::app::render::{FrameLinks, Panes, Renderer};
-use crate::app::term::callbacks::ReplySink;
+use crate::app::term::callbacks::{ReplySink, osc52};
 use crate::app::term::caps::{Capabilities, ChildRole};
 use crate::app::ui::tenant::Overlay;
 use crate::constants::*;
@@ -183,6 +184,9 @@ pub struct Container {
     /// The cell a press landed on, in whichever pane, so a click on a hyperlink
     /// can be told from a drag. `None` when the press was not on a link.
     link_press: Option<LinkPress>,
+    /// The mouse's text selection: the drag in progress, or the one just copied
+    /// and still shaded (see `input::mouse::Selection`).
+    selection: Option<Selection>,
     /// What a second `uncl` launched in the owner shell asked for (see
     /// `crate::app::control`). Filled in by the owner pane's parser, drained by
     /// the event loop as if it were the `Home` key.
@@ -252,6 +256,7 @@ impl Container {
             owner_scroll: 0,
             tenant_scroll: 0,
             link_press: None,
+            selection: None,
             control,
         }
     }
@@ -436,6 +441,7 @@ impl Container {
             focused_scrolled,
             float_title: float_title.as_deref(),
             pinned: self.lease.tenant.pinned,
+            selection: self.selection,
         });
 
         if !bytes.is_empty() {
@@ -495,6 +501,7 @@ impl Container {
         // reappear showing history nobody asked to see.
         self.tenant_scroll = 0;
         self.link_press = None;
+        self.clear_selection();
         self.refocus(self.float_focused());
         self.renderer.invalidate();
     }
@@ -540,6 +547,7 @@ impl Container {
             Ok(()) => {
                 self.tenant_scroll = 0;
                 self.link_press = None;
+                self.clear_selection();
                 self.tenant_retry_after = None;
                 // The old child's pictures belong to a process that no longer
                 // exists; the new one starts from an empty image layer.
@@ -624,6 +632,9 @@ impl Container {
     /// scrolling up at the top does not build up phantom offset that has to be
     /// unwound.
     fn scroll(&mut self, tenant: bool, wheel: Wheel, step: usize) {
+        // The cells under a selection are about to be different cells.
+        self.clear_selection();
+
         let capacity = self.scrollback_len(tenant);
         if capacity == 0 {
             return;
@@ -668,6 +679,131 @@ impl Container {
     fn reset_scroll(&mut self) {
         self.owner_scroll = 0;
         self.tenant_scroll = 0;
+    }
+
+    /// Does this event belong to a text selection instead of to the child?
+    ///
+    /// uncl holds the host's mouse, so the host can never select anything: a drag
+    /// over a shell's output arrives here, and the text behind it is a grid uncl
+    /// already owns. A child that has *not* asked for the mouse (every shell) is
+    /// not being sent these events anyway, so a plain drag selects. A child that
+    /// has asked keeps them, as every terminal does, until `Shift` says otherwise.
+    fn selection_owns(&self, tenant: bool, m: MouseEvent, wants_mouse: bool) -> bool {
+        // `Alt` is uncl's geometry modifier: alt-drag moves the float, and a drag
+        // that moves a window is not a drag over text.
+        let alt = m.modifiers.contains(KeyModifiers::ALT);
+
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                !alt && (!wants_mouse || m.modifiers.contains(KeyModifiers::SHIFT))
+            }
+            // A drag or a release that continues a selection is ours whatever the
+            // modifiers say now: letting go of `Shift` mid-drag must not hand the
+            // rest of the gesture to a child that never saw it begin.
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                self.selection
+                    .is_some_and(|selection| selection.tenant == tenant)
+            }
+            _ => false,
+        }
+    }
+
+    /// One step of a text selection: `Down` starts it, `Drag` grows it, `Up`
+    /// copies it.
+    ///
+    /// `Some(flow)` means the event was consumed. A press is consumed only when
+    /// the child asked for the mouse and `Shift` took it away from the child;
+    /// otherwise the press keeps walking, because a click on a hyperlink is still
+    /// a click and a drag is only a selection once it drags.
+    fn select(
+        &mut self,
+        tenant: bool,
+        m: MouseEvent,
+        cell: (u16, u16),
+        wants_mouse: bool,
+    ) -> Option<Flow> {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = Some(Selection::new(tenant, cell.0, cell.1));
+                self.renderer.invalidate();
+                wants_mouse.then_some(Flow::Redraw)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let selection = self.selection.as_mut()?;
+                if selection.head != cell {
+                    selection.extend(cell.0, cell.1);
+                    // The old edge has to be repainted before the new one is drawn.
+                    self.renderer.invalidate();
+                }
+                Some(Flow::Redraw)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let selection = self.selection?;
+                if !selection.dragged() {
+                    // A press and a release on one cell is a click, not a
+                    // selection of nothing: let the click path resolve it.
+                    self.selection = None;
+                    return None;
+                }
+                self.copy(selection);
+                self.link_press = None;
+                Some(Flow::Redraw)
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the selection and repaint the cells it shaded.
+    fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.renderer.invalidate();
+        }
+    }
+
+    /// One pane's visible grid, scroll offset and all.
+    ///
+    /// The same view `draw` paints from, so a selection copies the cells the user
+    /// was pointing at rather than the live grid under a scrolled-back one.
+    fn visible_screen(&self, tenant: bool) -> Option<Screen> {
+        let (parser, scroll) = if tenant {
+            (&self.lease.tenant_parser, self.tenant_scroll)
+        } else {
+            (&self.parser, self.owner_scroll)
+        };
+
+        let mut screen = parser.read().ok()?.screen().clone();
+        if scroll > 0 {
+            screen.set_scrollback(scroll);
+        }
+        Some(screen)
+    }
+
+    /// The text a selection would copy, or nothing when the pane is gone.
+    fn selection_text(&self, selection: Selection) -> String {
+        self.visible_screen(selection.tenant)
+            .map(|screen| selection.text(&screen))
+            .unwrap_or_default()
+    }
+
+    /// Hand a finished selection to the clipboard.
+    ///
+    /// A desktop helper comes first (`clipboard::copy`): it owns the clipboard a
+    /// paste actually reads, and needs no cooperation from the host terminal.
+    /// `OSC 52` is the fallback — and the only path that survives `ssh`, where a
+    /// helper would set the clipboard of the machine at the other end of the wire.
+    fn copy(&mut self, selection: Selection) {
+        let text = self.selection_text(selection);
+        if text.is_empty() {
+            return;
+        }
+
+        let remote = std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_TTY").is_some();
+        if remote || !clipboard::copy(&text) {
+            let _ = self
+                .host_tx
+                .send(osc52(b"c", &clipboard::base64(text.as_bytes())));
+        }
     }
 
     /// Follow a click inside the float, so a press and its release on the same
@@ -835,9 +971,24 @@ impl Container {
             return Flow::Continue;
         }
 
+        // `Ctrl+Shift+C` copies, for the hosts that let the chord through: a
+        // selection is already copied when it is released, so this is for the
+        // habit — and it stops the chord reaching the shell as `^C`. A host that
+        // keeps the chord for itself never sends it here at all.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
+            if let Some(selection) = self.selection {
+                self.copy(selection);
+                return Flow::Redraw;
+            }
+        }
+
         // Typing means "I am done reading history": every shell in every terminal
         // behaves this way, and the key is still delivered to the child below.
         self.reset_scroll();
+        self.clear_selection();
 
         // Escape hatch: Ctrl+Alt+q quits uncl without having to type `exit`
         // into whichever shell happens to have focus.
@@ -927,6 +1078,19 @@ impl Container {
             }
         }
         let focus_changed = was_focused != self.lease.tenant_focused;
+
+        // A drag over the float's text is uncl's to select, before the child is
+        // asked: the host never sees it, so nobody else can.
+        let content = self.lease.tenant.content_rect();
+        if content.contains(m.column, m.row) {
+            let wants_mouse = self.lease.modes().wants_mouse();
+            if self.selection_owns(true, m, wants_mouse) {
+                let cell = (m.row - content.y, m.column - content.x);
+                if let Some(flow) = self.select(true, m, cell, wants_mouse) {
+                    return flow;
+                }
+            }
+        }
 
         match mouse::route(&self.lease.tenant, m) {
             MouseRoute::Child { col, row } => {
@@ -1057,6 +1221,15 @@ impl Container {
             (ChildModes::from_screen(parser.screen()), self.rect)
         };
 
+        // The same rule as the float, in the shell behind it: a drag over text is
+        // a selection unless the child asked for the mouse and `Shift` did not.
+        if area.contains(m.column, m.row) && self.selection_owns(false, m, modes.wants_mouse()) {
+            let cell = (m.row.saturating_sub(area.y), m.column.saturating_sub(area.x));
+            if let Some(flow) = self.select(false, m, cell, modes.wants_mouse()) {
+                return flow;
+            }
+        }
+
         // Most shells never enable mouse reporting; skip the encode entirely.
         // Either way the child is asked first: only if it declined does the event
         // become uncl's — the wheel scrolls its history, and a click opens a
@@ -1093,6 +1266,7 @@ impl Container {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(m) => self.handle_mouse(m),
             Event::Paste(text) => {
+                self.clear_selection();
                 self.forward_paste(&text);
                 Flow::Continue
             }
@@ -1107,6 +1281,7 @@ impl Container {
                 Flow::Continue
             }
             Event::Resize(cols, rows) => {
+                self.clear_selection();
                 self.size = Size { cols, rows };
                 self.rect = Rect::new(0, 0, cols, rows);
                 self.parser.write().unwrap().set_size(nz(rows), nz(cols));
@@ -1651,5 +1826,170 @@ mod tests {
         // first keeps a previous `?1003` state from leaking through.
         let expected: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1000h\x1b[?1006h";
         assert_eq!(HostMouse::ButtonMotion.sequence(), expected);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    /// A container with the float hidden, so every mouse event is the owner's.
+    fn shell(text: &[u8]) -> Container {
+        let mut container = Container::new(true);
+        container.rect = Rect::new(0, 0, 40, 10);
+        container.size = Size { cols: 40, rows: 10 };
+        container.parser.write().unwrap().process(text);
+        container
+    }
+
+    #[test]
+    fn a_drag_over_the_shell_selects_and_the_release_copies_it() {
+        let mut container = shell(b"hello world");
+        let left = |kind| mouse(kind, 6, 0, KeyModifiers::NONE);
+
+        // A shell never asks for the mouse, so the press is already a candidate.
+        container.handle_mouse(left(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            container.selection.map(|s| s.dragged()),
+            Some(false),
+            "a press alone is not a drag"
+        );
+
+        container.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            0,
+            KeyModifiers::NONE,
+        ));
+        let selection = container.selection.expect("the drag is a selection");
+        assert!(selection.dragged());
+        assert_eq!(container.selection_text(selection), "world");
+
+        container.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            10,
+            0,
+            KeyModifiers::NONE,
+        ));
+        // The selection is kept after the copy, so the user can see what went.
+        assert_eq!(container.selection, Some(selection));
+    }
+
+    #[test]
+    fn a_click_selects_nothing() {
+        let mut container = shell(b"hello world");
+        container.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            0,
+            KeyModifiers::NONE,
+        ));
+        container.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            6,
+            0,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(container.selection, None);
+    }
+
+    #[test]
+    fn typing_drops_the_selection() {
+        let mut container = shell(b"hello world");
+        container.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            0,
+            KeyModifiers::NONE,
+        ));
+        container.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            0,
+            KeyModifiers::NONE,
+        ));
+        assert!(container.selection.is_some());
+
+        container.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(container.selection, None);
+    }
+
+    #[test]
+    fn a_child_that_wants_the_mouse_keeps_a_plain_drag() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = true;
+        container.lease.tenant.rect = Rect::new(5, 2, 30, 10);
+        container.size = Size { cols: 80, rows: 24 };
+        // Mouse reporting on, SGR encoding: a TUI, not a shell.
+        container
+            .lease
+            .tenant_parser
+            .write()
+            .unwrap()
+            .process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(container.lease.modes().wants_mouse());
+
+        let content = container.lease.tenant.content_rect();
+        let (column, row) = (content.x + 1, content.y + 1);
+
+        container.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            container.selection, None,
+            "a plain press belongs to the child that asked for it"
+        );
+
+        container.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            container.selection.map(|s| s.tenant),
+            Some(true),
+            "Shift takes the press back for the selection"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_a_selection_instead_of_reaching_the_shell() {
+        let mut container = shell(b"hello world");
+        container.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            0,
+            KeyModifiers::NONE,
+        ));
+        container.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            10,
+            0,
+            KeyModifiers::NONE,
+        ));
+        let selection = container.selection.expect("a selection to copy");
+        assert_eq!(container.selection_text(selection), "world");
+
+        // The last key a user presses after selecting is often this one, out of
+        // habit; it must copy, and must not reach the shell as `^C`.
+        assert_eq!(
+            container.handle_key(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Flow::Redraw
+        );
+        // The selection is not treated as typing: it survives the chord.
+        assert_eq!(container.selection, Some(selection));
     }
 }
