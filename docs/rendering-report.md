@@ -230,7 +230,12 @@ it) and focus in/out is sent to whichever pane gains or loses the keyboard. The
 focused pane's `DECSCUSR` shape is relayed to the host and reset on exit, so nvim's
 insert-mode beam is a beam.
 
-**The chords.** `Home` toggles the float. `Alt`+arrows move it, `Alt`+Shift+arrows
+**The chords.** `Home` toggles the float, pinned or not, and a second `uncl`
+launched in the owner shell asks for the same thing through the pane's pty
+(`launch_toggle`) rather than nesting. The one state the two disagree on is a
+pinned float that is already on screen with the keyboard in the shell behind it —
+where `Home` cannot be pressed, and where a launch is a redundant "raise it", so
+it takes the keyboard instead of putting the window away. `Alt`+arrows move it, `Alt`+Shift+arrows
 resize it. `Ctrl+Alt+q` quits. `Ctrl+Alt+Up/Down` and `Ctrl+Alt+PageUp/PageDown`
 scroll the focused pane. `Ctrl+C` copies the selection and `Ctrl+V` pastes, and both
 fall through to the child when there is nothing for them to do. Everything else is delivered to whichever pane owns the
