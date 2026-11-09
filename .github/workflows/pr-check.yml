@@ -1,0 +1,15 @@
+name: pr-check
+on:
+  pull_request:
+    branches: [dev]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        run: cargo test --locked --all-targets
