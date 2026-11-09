@@ -466,20 +466,40 @@ impl Container {
 
     /// Show the float, or put it away — the `Home` key, and nothing else.
     ///
-    /// This is also what a second `uncl` launched in the owner shell does: it
-    /// asks for this through the pty rather than nesting, so a launch and the
-    /// key must be the same thing down to the focus hand-off (see
-    /// `crate::app::control`).
-    ///
     /// Raising the float is also the only thing that starts a replacement shell
     /// after the last one exited: `exit` closes the window (`tenant_closed`) and
     /// leaves it closed, so a toggle is a decision the user makes rather than
     /// something that happens under their hands.
+    ///
+    /// A pin does not change this: `Home` puts a pinned float away like any
+    /// other, and the pin is still set when it comes back. The one caller that
+    /// differs is a launch from the shell behind the float, which has its own
+    /// case for one that is pinned and already on screen — see
+    /// [`Self::launch_toggle`].
     fn toggle_float(&mut self) {
         if self.lease.tenant_visible {
             self.hide_float();
         } else {
             self.show_float();
+        }
+    }
+
+    /// What a second `uncl` launched in the owner shell gets instead of nesting.
+    ///
+    /// It asks for this through the pane's pty (see `crate::app::control`), and
+    /// for almost every state it is `Home` down to the focus hand-off.
+    ///
+    /// The exception is a pinned float that is already on screen *with the
+    /// keyboard in the shell behind it* — the state pinning exists for, and a
+    /// state `Home` cannot be pressed in. A launch there is a redundant "raise
+    /// it", so it takes the keyboard rather than putting the window away: the
+    /// pin is the user asking for the window to stay, and a stray `uncl` typed
+    /// in the shell should not take it away and hand it back on the next try.
+    fn launch_toggle(&mut self) {
+        if self.lease.tenant_visible && self.lease.tenant.pinned {
+            self.show_float();
+        } else {
+            self.toggle_float();
         }
     }
 
@@ -1517,13 +1537,14 @@ impl Container {
             }
 
             // A second `uncl` started in the owner shell asked for the float to
-            // be toggled instead of nesting. It is the `Home` key arriving
-            // through the pty, so it is applied before the focus-dependent
-            // housekeeping below: a launch must leave the host's mouse grab and
-            // cursor exactly where the key would leave them (see
+            // be raised instead of nesting. It is the `Home` key arriving
+            // through the pty, apart from a pinned float that is already on
+            // screen (`launch_toggle`), so it is applied before the
+            // focus-dependent housekeeping below: a launch must leave the host's
+            // mouse grab and cursor exactly where the key would leave them (see
             // `crate::app::control`).
             if self.control.take_toggle() {
-                self.toggle_float();
+                self.launch_toggle();
                 redraw = true;
             }
 
@@ -2089,7 +2110,7 @@ mod tests {
             "the request is taken once, not on every frame"
         );
 
-        container.toggle_float();
+        container.launch_toggle();
         assert_eq!(container.lease.tenant_visible, !was_visible);
         assert_eq!(container.lease.tenant_focused, !was_visible);
 
@@ -2097,6 +2118,87 @@ mod tests {
         let flow = container.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(flow, Flow::Redraw);
         assert_eq!(container.lease.tenant_visible, was_visible);
+    }
+
+    /// A container with the float on screen, `dummy` for its shell, and the
+    /// keyboard wherever `focused` says, pinned or not.
+    fn float_on_screen(pinned: bool, focused: bool) -> Container {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = true;
+        container.lease.tenant_focused = focused;
+        container.lease.tenant.pinned = pinned;
+        container
+    }
+
+    /// What a second `uncl`, started in the owner shell, writes to that shell's
+    /// pty — and what the event loop then does with it.
+    fn launch_from_the_owner_shell(container: &mut Container) -> bool {
+        container
+            .parser
+            .write()
+            .unwrap()
+            .process(crate::app::control::TOGGLE_REQUEST);
+        let requested = container.control.take_toggle();
+        if requested {
+            container.launch_toggle();
+        }
+        requested
+    }
+
+    #[test]
+    fn a_nested_launch_focuses_a_pinned_float_instead_of_hiding_it() {
+        // Pinned, on screen, keyboard in the shell behind it: the state pinning
+        // exists for, and the one a launch gets "redundantly".
+        let mut container = float_on_screen(true, false);
+
+        assert!(launch_from_the_owner_shell(&mut container), "the request arrives");
+
+        assert!(
+            container.lease.tenant_visible,
+            "a pinned float stays where the user put it"
+        );
+        assert!(
+            container.lease.tenant_focused,
+            "and a redundant launch raises it into the keyboard"
+        );
+    }
+
+    #[test]
+    fn home_still_puts_a_pinned_float_away() {
+        let mut container = float_on_screen(true, false);
+
+        let flow = container.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+
+        assert_eq!(flow, Flow::Redraw);
+        assert!(!container.lease.tenant_visible, "`Home` is still a toggle");
+        assert!(container.lease.tenant.pinned, "and the pin survives it");
+    }
+
+    #[test]
+    fn a_nested_launch_with_no_float_on_screen_raises_it() {
+        let mut container = Container::new(true);
+        container.lease.attach(PtySession::dummy());
+        container.lease.tenant_visible = false;
+        container.lease.tenant.pinned = true;
+
+        assert!(launch_from_the_owner_shell(&mut container));
+
+        assert!(container.lease.tenant_visible);
+        assert!(
+            container.lease.tenant_focused,
+            "raising takes the keyboard, pinned or not"
+        );
+    }
+
+    #[test]
+    fn a_nested_launch_with_an_unpinned_float_still_toggles_it() {
+        let mut container = float_on_screen(false, true);
+
+        assert!(launch_from_the_owner_shell(&mut container));
+
+        assert!(!container.lease.tenant_visible, "this is `Home` again");
+        assert!(!container.lease.tenant_focused);
     }
 
     #[test]
