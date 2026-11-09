@@ -1,0 +1,12 @@
+[package]
+name = "uncl"
+version = "0.1.11"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29"
+portable-pty = "0.8.1"
+anyhow = "1.0.98"
+vt100 = "0.18.1"
+tokio = { version = "1.44.2", features = ["full"] }
+bytes = "1.11.1"

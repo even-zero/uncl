@@ -1,0 +1,386 @@
+use crate::app::images::Store;
+use crate::app::pty::{self, ChildParser, PtySession};
+use crate::app::signal::Signal;
+use crate::app::term::callbacks::ReplySink;
+use crate::app::term::caps::ChildRole;
+use crate::constants::{MIN_HEIGHT, MIN_WIDTH, PIN_WIDTH, ResizeEdges, content_rect, nz};
+use crate::geometry::Rect;
+
+use anyhow::Result;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use portable_pty::CommandBuilder;
+
+use std::sync::{Arc, Mutex, RwLock};
+
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+pub struct Overlay {
+    pub rect: Rect,
+    pub dragging: bool,
+    pub drag_offset: (u16, u16),
+    pub resizing: bool,
+    /// Which edges of the float a resize gesture grabbed; an edge press anchors
+    /// one axis, a corner press both.
+    pub resize_anchored: ResizeEdges,
+    pub size: Size,
+    /// A gesture started inside the child's grid: it owns the pointer until the
+    /// button comes up, even if the pointer leaves the float.
+    pub child_grab: bool,
+    /// Sticky: the float stays on screen when the pointer leaves it, so the
+    /// owner pane can be used beside it instead of the float disappearing.
+    pub pinned: bool,
+}
+
+impl Overlay {
+    /// Construct an overlay with a specific rectangle.
+    pub fn with_rect(rect: Rect) -> Self {
+        Self {
+            rect,
+            dragging: false,
+            drag_offset: (0, 0),
+            resizing: false,
+            resize_anchored: ResizeEdges::default(),
+            size: Size {
+                cols: rect.width,
+                rows: rect.height,
+            },
+            child_grab: false,
+            pinned: false,
+        }
+    }
+
+    /// An overlay positioned in the center of `viewport` (cols, rows),
+    /// defaulting to 80 (width) x 25 (height).
+    pub fn centered(viewport: (u16, u16)) -> Self {
+        Self::with_rect(crate::app::state::centered_tenant_rect(viewport))
+    }
+
+    /// The area the child actually draws into: the rect minus its border.
+    ///
+    /// This is the single source of truth for three numbers that used to
+    /// disagree by two cells: the size the pty is told, the size the parser
+    /// grid is set to, and the area the renderer paints into.
+    pub fn content_rect(&self) -> Rect {
+        content_rect(self.rect)
+    }
+
+    /// `(rows, cols)` of [`Self::content_rect`].
+    pub fn content_size(&self) -> (u16, u16) {
+        let content = self.content_rect();
+        (content.height, content.width)
+    }
+
+    /// The pin control's cells, ending at the penultimate cell of the top border.
+    ///
+    /// `None` when the float is too narrow to hold three cells beside its
+    /// corner, so a tiny window degrades to a plain border rather than overlapping
+    /// itself.
+    pub fn pin_cell(&self) -> Option<Rect> {
+        if self.rect.width < PIN_WIDTH + 2 {
+            return None;
+        }
+        Some(Rect::new(
+            self.rect.right().saturating_sub(PIN_WIDTH + 1),
+            self.rect.y,
+            PIN_WIDTH,
+            1,
+        ))
+    }
+
+    /// Flip the pin, reporting whether it is pinned now.
+    pub fn toggle_pin(&mut self) -> bool {
+        self.pinned = !self.pinned;
+        self.pinned
+    }
+
+    /// Spawn the floating shell. No terminal state is touched here: the owner
+    /// screen is already in raw mode and owns the alternate screen, so flipping
+    /// raw mode on and off again (the old behaviour) only caused flicker.
+    pub fn spawn(
+        &mut self,
+        parser: Arc<RwLock<ChildParser>>,
+        sink: ReplySink,
+        signal: Arc<Signal>,
+        caps: Arc<crate::app::term::caps::Capabilities>,
+        images: Arc<Mutex<Store>>,
+    ) -> Result<PtySession> {
+        let (rows, cols) = self.content_size();
+
+        // The grid must match the size the child is told, from the first byte.
+        parser.write().unwrap().set_size(nz(rows), nz(cols));
+
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.cwd(std::env::current_dir()?);
+        // The float's children are told they are in the float, which is how a
+        // second `uncl` launched here knows to refuse instead of nesting (see
+        // `crate::app::control`).
+        caps.apply_child_env(&mut cmd, ChildRole::Tenant);
+
+        let session = pty::spawn(cmd, rows, cols, parser, sink, signal, Some(images), caps)?;
+        Ok(session)
+    }
+
+    /// Resize the float, clamped to the terminal and to [`MIN_WIDTH`] x
+    /// [`MIN_HEIGHT`].
+    ///
+    /// The `MIN_*` guard is on the *result*, not on the request: while dragging
+    /// an edge, the requested height passes through values below the minimum
+    /// (dragging up past the top), and the old code bailed out completely, which
+    /// made the float stop responding mid-drag.
+    pub fn resize_to(
+        &mut self,
+        mut x: u16,
+        mut y: u16,
+        mut width: u16,
+        mut height: u16,
+        bounds: (u16, u16),
+    ) {
+        let max_width = bounds.0.max(1);
+        let max_height = bounds.1.max(1);
+
+        width = width.clamp(MIN_WIDTH.min(max_width), max_width);
+        height = height.clamp(MIN_HEIGHT.min(max_height), max_height);
+
+        x = x.min(max_width.saturating_sub(width));
+        y = y.min(max_height.saturating_sub(height));
+
+        self.rect.x = x;
+        self.rect.y = y;
+        self.rect.width = width;
+        self.rect.height = height;
+        self.size.cols = width;
+        self.size.rows = height;
+    }
+
+    /// Keep the float inside a terminal that just changed size.
+    pub fn clamp_to(&mut self, bounds: (u16, u16)) {
+        let width = self.rect.width.min(bounds.0).max(MIN_WIDTH.min(bounds.0));
+        let height = self.rect.height.min(bounds.1).max(MIN_HEIGHT.min(bounds.1));
+        let x = self.rect.x.min(bounds.0.saturating_sub(width));
+        let y = self.rect.y.min(bounds.1.saturating_sub(height));
+
+        self.rect = Rect::new(x, y, width, height);
+        self.size = Size {
+            cols: width,
+            rows: height,
+        };
+    }
+
+    /// Handle uncl's own geometry chords.
+    ///
+    /// `Alt`+arrows move the float, `Alt`+`Shift`+arrows resize it. Everything
+    /// else belongs to the child: `Shift`/`Ctrl`+arrows used to be stolen for
+    /// geometry, which broke text selection and word motion in every editor we
+    /// put in the float.
+    ///
+    /// Returns `true` when the chord was consumed.
+    pub fn geometry_key(&mut self, key: KeyEvent, bounds: (u16, u16)) -> bool {
+        if !key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+
+        let resize = key.modifiers.contains(KeyModifiers::SHIFT);
+        let rect = self.rect;
+
+        match (resize, key.code) {
+            (false, KeyCode::Left) => self.move_to(rect.x.saturating_sub(1), rect.y, bounds),
+            (false, KeyCode::Right) => self.move_to(rect.x + 1, rect.y, bounds),
+            (false, KeyCode::Up) => self.move_to(rect.x, rect.y.saturating_sub(1), bounds),
+            (false, KeyCode::Down) => self.move_to(rect.x, rect.y + 1, bounds),
+
+            (true, KeyCode::Left) => self.resize_to(
+                rect.x,
+                rect.y,
+                rect.width.saturating_sub(1),
+                rect.height,
+                bounds,
+            ),
+            (true, KeyCode::Right) => {
+                self.resize_to(rect.x, rect.y, rect.width + 1, rect.height, bounds)
+            }
+            (true, KeyCode::Up) => self.resize_to(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height.saturating_sub(1),
+                bounds,
+            ),
+            (true, KeyCode::Down) => {
+                self.resize_to(rect.x, rect.y, rect.width, rect.height + 1, bounds)
+            }
+
+            _ => return false,
+        }
+
+        true
+    }
+
+    pub fn move_to(&mut self, target_x: u16, target_y: u16, bounds: (u16, u16)) {
+        let max_x = bounds.0.saturating_sub(self.rect.width);
+        let max_y = bounds.1.saturating_sub(self.rect.height);
+
+        self.rect.x = target_x.min(max_x);
+        self.rect.y = target_y.min(max_y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+
+    fn overlay() -> Overlay {
+        Overlay::with_rect(Rect::new(10, 5, DEFAULT_WIDTH, DEFAULT_HEIGHT))
+    }
+
+    #[test]
+    fn content_rect_is_inset_by_the_border() {
+        let overlay = overlay();
+        let content = overlay.content_rect();
+        assert_eq!(content.x, overlay.rect.x + crate::constants::TENANT_BORDER);
+        assert_eq!(content.y, overlay.rect.y + crate::constants::TENANT_BORDER);
+        assert_eq!(
+            content.width,
+            overlay.rect.width - crate::constants::TENANT_BORDER * 2
+        );
+        assert_eq!(
+            content.height,
+            overlay.rect.height - crate::constants::TENANT_BORDER * 2
+        );
+    }
+
+    #[test]
+    fn content_size_is_derived_from_content_rect() {
+        let overlay = overlay();
+        let (rows, cols) = overlay.content_size();
+        assert_eq!(
+            (cols, rows),
+            (overlay.content_rect().width, overlay.content_rect().height)
+        );
+    }
+
+    #[test]
+    fn content_size_never_reaches_zero() {
+        let mut overlay = overlay();
+        overlay.rect = Rect::new(0, 0, 1, 1);
+        assert_eq!(overlay.content_size(), (1, 1));
+    }
+
+    #[test]
+    fn the_pin_control_sits_in_the_top_right_corner() {
+        let overlay = overlay();
+        let pin = overlay
+            .pin_cell()
+            .expect("a default float has room for the pin");
+        assert_eq!(pin.y, overlay.rect.y);
+        assert_eq!(pin.x.saturating_add(pin.width), overlay.rect.right() - 1);
+        assert_eq!(pin.width, PIN_WIDTH);
+        assert_eq!(pin.height, 1);
+    }
+
+    #[test]
+    fn a_float_too_narrow_for_the_pin_has_none() {
+        let mut overlay = overlay();
+        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 1, 4);
+        assert!(overlay.pin_cell().is_none());
+        overlay.rect = Rect::new(0, 0, PIN_WIDTH + 2, 4);
+        assert!(overlay.pin_cell().is_some());
+    }
+
+    #[test]
+    fn toggling_the_pin_reports_the_new_state() {
+        let mut overlay = overlay();
+        assert!(!overlay.pinned);
+        assert!(overlay.toggle_pin());
+        assert!(overlay.pinned);
+        assert!(!overlay.toggle_pin());
+        assert!(!overlay.pinned);
+    }
+
+    #[test]
+    fn resize_keeps_the_float_inside_the_screen() {
+        let mut overlay = overlay();
+        overlay.resize_to(100, 100, 500, 500, (120, 40));
+        assert!(overlay.rect.x + overlay.rect.width <= 120);
+        assert!(overlay.rect.y + overlay.rect.height <= 40);
+    }
+
+    #[test]
+    fn resizing_never_goes_below_the_minimum() {
+        let mut overlay = overlay();
+        overlay.resize_to(0, 0, 1, 1, (80, 25));
+        assert_eq!(overlay.rect.width, MIN_WIDTH);
+        assert_eq!(overlay.rect.height, MIN_HEIGHT);
+    }
+
+    #[test]
+    fn resizing_below_the_minimum_does_not_freeze_the_drag() {
+        // The old code returned early for any request under MIN_HEIGHT, so
+        // dragging the bottom edge upwards appeared to stop responding. The
+        // width must still track the pointer.
+        let mut overlay = overlay();
+        let before = overlay.rect;
+        // Bounds larger than the float, so the clamp is not what is under test.
+        overlay.resize_to(before.x, before.y, before.width + 5, 2, (200, 60));
+        assert_eq!(overlay.rect.width, before.width + 5);
+        assert_eq!(overlay.rect.height, MIN_HEIGHT);
+    }
+
+    #[test]
+    fn clamp_to_pulls_the_float_back_on_screen() {
+        let mut overlay = overlay();
+        overlay.resize_to(30, 15, 40, 20, (200, 80));
+        overlay.clamp_to((50, 20));
+        assert!(overlay.rect.right() <= 50);
+        assert!(overlay.rect.bottom() <= 20);
+        assert!(overlay.rect.width >= MIN_WIDTH.min(50));
+        assert!(overlay.rect.height >= MIN_HEIGHT.min(20));
+    }
+
+    #[test]
+    fn modifiers_alone_are_not_geometry_chords() {
+        let mut overlay = overlay();
+        let before = overlay.rect;
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        assert!(!overlay.geometry_key(key, (120, 60)));
+        assert_eq!(overlay.rect, before);
+    }
+
+    #[test]
+    fn alt_arrows_move_and_alt_shift_arrows_resize() {
+        let mut overlay = overlay();
+        let before = overlay.rect;
+
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        assert!(overlay.geometry_key(key, (120, 60)));
+        assert_eq!(overlay.rect.x, before.x + 1);
+        assert_eq!(overlay.rect.width, before.width);
+
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert!(overlay.geometry_key(key, (120, 60)));
+        assert_eq!(overlay.rect.height, before.height + 1);
+        assert_eq!(overlay.rect.width, before.width);
+    }
+
+    #[test]
+    fn move_to_clamps_at_the_edges() {
+        let mut overlay = overlay();
+        overlay.move_to(1000, 1000, (82, 27));
+        assert_eq!(overlay.rect.x, 82 - overlay.rect.width);
+        assert_eq!(overlay.rect.y, 27 - overlay.rect.height);
+    }
+
+    #[test]
+    fn centered_overlay_is_centered_in_viewport() {
+        let overlay = Overlay::centered((120, 40));
+        assert_eq!(overlay.rect.width, 82);
+        assert_eq!(overlay.rect.height, 27);
+        assert_eq!(overlay.rect.x, 19);
+        assert_eq!(overlay.rect.y, 6);
+    }
+}
