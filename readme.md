@@ -33,8 +33,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - clickable links inside the float
 - scrollback in both panes
 - mouse support in both panes
-- select text in either pane with the mouse and copy it on release; paste is
-  your terminal's own (`OSC 52` for children that ask for it)
+- copy and paste (`OSC 52`)
 - children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
   `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
   `tmux` dialects, and kitty's keyboard protocol. `uncl --doctor` prints both
@@ -72,10 +71,8 @@ launched in:
   to the shell, exactly as in every other terminal.
 - uncl holds the mouse while it runs - that is how the float stays draggable, and
   how a click on a link gets resolved at all - so your terminal emulator's own
-  scrollback and selection are not available inside uncl. both are uncl's: drag
-  over text to select it (the release copies it, to `wl-copy`/`xclip`/`pbcopy`
-  when one is installed and as an `OSC 52` write when not), and `Shift`+drag
-  selects inside an app that asked for the mouse itself.
+  scrollback is not available inside uncl. uncl's is. `Shift`+drag still selects
+  text in most emulators, because they take that key back locally.
 
 ## installing
 

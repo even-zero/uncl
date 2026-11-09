@@ -464,8 +464,7 @@ fn help() {
          Alt+arrows         move it\n  \
          Alt+Shift+arrows   resize it\n  \
          Alt+drag           move it with the mouse\n  \
-         border drag        resize it with the mouse\n  \
-         drag / shift+drag  select text; the release copies it\n\n\
+         border drag        resize it with the mouse\n\n\
          nesting:\n  \
          uncl does not nest: running it in the background shell toggles the float\n  \
          exactly like Home, and running it inside the float is refused with a\n  \

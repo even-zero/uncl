@@ -1,4 +1,4 @@
-//! Reading and writing the *system* clipboard, for `OSC 52`.
+//! Reading the *system* clipboard, for `OSC 52 ; <sel> ; ?`.
 //!
 //! A child asking to paste is asking the terminal, and the terminal's clipboard is
 //! the desktop's. uncl cannot ask the host terminal for it: the reply travels back
@@ -11,11 +11,6 @@
 //! PowerShell's `Get-Clipboard`. One process per paste *query*, not per keystroke,
 //! and none at all if the tools are missing — in which case the request stays
 //! unanswered, which is the truthful reply for a terminal with no clipboard.
-//!
-//! Writing is the same problem in the other direction, and the same answer: a
-//! selection uncl made itself (see `ui::owner`) is handed to `wl-copy`, `xclip`,
-//! `pbcopy` and friends, and only falls back to an `OSC 52` *write* for the host
-//! terminal when none of them can take it.
 //!
 //! Everything here that can be pure is pure, so the decisions are testable without
 //! a desktop: which selection a selector means, which programs to try, and the
@@ -155,87 +150,6 @@ pub fn read(ty: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// The programs that can *own* the clipboard, in the order they are tried.
-///
-/// Writing and reading are different programs on X11 (`xclip -i` against `-o`),
-/// and `wl-copy` daemonises to serve the selection, so this is its own table
-/// rather than a flag on the reader's.
-#[cfg(target_os = "linux")]
-fn writers() -> &'static [&'static [&'static str]] {
-    const WRITERS: &[&[&str]] = &[
-        &["wl-copy"],
-        &["xclip", "-selection", "clipboard", "-i"],
-        &["xsel", "--clipboard", "--input"],
-    ];
-    WRITERS
-}
-
-#[cfg(target_os = "macos")]
-fn writers() -> &'static [&'static [&'static str]] {
-    const WRITERS: &[&[&str]] = &[&["pbcopy"]];
-    WRITERS
-}
-
-#[cfg(windows)]
-fn writers() -> &'static [&'static [&'static str]] {
-    // Reading stdin in one go is what makes the pipe a single clipboard write
-    // rather than one per line.
-    const SET: &str = "Set-Clipboard -Value ([Console]::In.ReadToEnd())";
-    const WRITERS: &[&[&str]] = &[
-        &["pwsh", "-NoProfile", "-Command", SET],
-        &["powershell", "-NoProfile", "-Command", SET],
-    ];
-    WRITERS
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn writers() -> &'static [&'static [&'static str]] {
-    const WRITERS: &[&[&str]] = &[&["pbcopy"]];
-    WRITERS
-}
-
-/// Put `text` on the system clipboard, or report that nothing here can.
-///
-/// The desktop helper comes first because it is the clipboard a paste actually
-/// reads: a host terminal may ignore `OSC 52` entirely, and then a copy written
-/// only as a sequence would vanish without a word. The caller falls back to
-/// `OSC 52` — the path that survives `ssh`, where a helper would set the *wrong*
-/// machine's clipboard — so returning `false` means "there is no helper, try the
-/// host".
-///
-/// The helper is never waited for here: `wl-copy` and `xclip` stay alive to serve
-/// the selection until something else takes it. It is fed on a thread of its own
-/// and reaped there, so a copy cannot stall the frame loop.
-pub fn copy(text: &str) -> bool {
-    for argv in writers() {
-        let Some((program, args)) = argv.split_first() else {
-            continue;
-        };
-        let Ok(mut child) = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            continue;
-        };
-        let text = text.to_string();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(text.as_bytes());
-            drop(stdin);
-            let _ = child.wait();
-        });
-        return true;
-    }
-
-    false
-}
-
 /// Standard base64, as `OSC 52` wants it.
 ///
 /// Hand-rolled for the same reason the decoder in `app::images` is: it is twenty
@@ -302,17 +216,6 @@ mod tests {
         assert!(!candidates(Selection::Clipboard).is_empty());
         for argv in candidates(Selection::Clipboard) {
             assert!(!argv.is_empty(), "a candidate with no program name");
-            assert!(!argv[0].is_empty());
-        }
-    }
-
-    #[test]
-    fn the_clipboard_always_has_a_program_to_write_with() {
-        // A platform with no writer would mean every copy falls back to `OSC 52`,
-        // which is exactly what a host that ignores it would swallow.
-        assert!(!writers().is_empty());
-        for argv in writers() {
-            assert!(!argv.is_empty(), "a writer with no program name");
             assert!(!argv[0].is_empty());
         }
     }
