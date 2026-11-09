@@ -4,6 +4,7 @@ on:
     branches: [dev]
 permissions:
   contents: read
+  pull-requests: write
   issues: write
 jobs:
   test:
@@ -13,26 +14,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test
+        shell: bash {0}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          set +e
-          cargo test --locked --all-targets 2>&1 | tee /tmp/build.log
-          code=${PIPESTATUS[0]}
+          cargo test --locked --all-targets > /tmp/build.log 2>&1
+          code=$?
           echo "cargo test exit=$code"
           if [ "$code" -ne 0 ]; then
-            python3 - <<'PY'
-          import json, os, urllib.request
-          log = open('/tmp/build.log', errors='replace').read()[-55000:]
-          body = {"body": "```\n" + log + "\n```"}
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{os.environ['GH_REPO']}/issues/51/comments",
-              data=json.dumps(body).encode(),
-              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                       "Accept": "application/vnd.github+json"})
-          urllib.request.urlopen(req).read()
-          print("posted the build log as a comment")
-          PY
-            exit "$code"
+            python3 .github/post_log.py
           fi
+          exit "$code"
