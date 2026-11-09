@@ -18,8 +18,14 @@
 //!   until the button comes up. Losing that `Up` is what leaves a selection
 //!   stuck.
 //!
+//! * a drag the child did not ask for, or a `Shift` drag it did → a text
+//!   selection ([`Selection`]). The host never sees the mouse, so the host can
+//!   never select: a drag over a shell's output has to be uncl's.
+//!
 //! Everything here is pure geometry plus a little drag state, which keeps the
 //! routing decisions testable.
+
+use vt100::Screen;
 
 use crate::app::ui::tenant::Overlay;
 use crate::constants::{MIN_HEIGHT, MIN_WIDTH, ResizeEdges};
@@ -286,6 +292,110 @@ pub fn end(overlay: &mut Overlay) -> bool {
     overlay.resizing = false;
     overlay.resize_anchored = ResizeEdges::default();
     was_active
+}
+
+/// A text selection in one pane, in that pane's own visible cells.
+///
+/// uncl holds the host's mouse, so the host terminal never sees a drag and cannot
+/// select anything: the drag arrives here, names a cell, and the text behind that
+/// cell is in a `vt100` grid uncl already owns. The selection is therefore uncl's
+/// and so is the copy (see `ui::owner`).
+///
+/// Coordinates are `(row, column)` relative to the pane's grid, and they name the
+/// *visible* grid — the snapshot the frame was painted from, scroll offset and
+/// all — so what is copied is what was pointed at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    /// Which pane: the float, or the shell behind it.
+    pub tenant: bool,
+    /// Where the press landed.
+    pub anchor: (u16, u16),
+    /// Where the pointer is now.
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    pub fn new(tenant: bool, row: u16, col: u16) -> Self {
+        Self {
+            tenant,
+            anchor: (row, col),
+            head: (row, col),
+        }
+    }
+
+    /// Move the loose end, keeping the anchor where the press put it.
+    pub fn extend(&mut self, row: u16, col: u16) {
+        self.head = (row, col);
+    }
+
+    /// Has the pointer left the cell the press landed on?
+    ///
+    /// A press and its release on one cell is a click — a hyperlink, say — and
+    /// not a selection of nothing.
+    pub fn dragged(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    /// The corners, top-left first, so a drag in any direction is the same
+    /// selection.
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Every row the selection covers, top to bottom.
+    pub fn rows(&self) -> std::ops::RangeInclusive<u16> {
+        let ((first, _), (last, _)) = self.ordered();
+        first..=last
+    }
+
+    /// The columns selected on `row`, as a half-open range clamped to `width`.
+    ///
+    /// `None` on a row the selection does not reach, and for the empty range a
+    /// drag that never left its first cell produces.
+    pub fn span(&self, row: u16, width: u16) -> Option<std::ops::Range<u16>> {
+        let ((first_row, first_col), (last_row, last_col)) = self.ordered();
+        if row < first_row || row > last_row {
+            return None;
+        }
+
+        let from = if row == first_row { first_col } else { 0 };
+        // The cell under the pointer is part of the selection, so the end is
+        // inclusive and becomes half-open here.
+        let to = if row == last_row {
+            last_col.saturating_add(1)
+        } else {
+            width
+        };
+        let to = to.min(width);
+
+        (from < to).then_some(from..to)
+    }
+
+    /// The selected text: rows joined with newlines, trailing blanks dropped.
+    ///
+    /// A row's tail is padding, not content: a shell's grid is full of blanks, and
+    /// a copy that carried them would be full of trailing spaces.
+    pub fn text(&self, screen: &Screen) -> String {
+        // `size()` is `(rows, columns)`.
+        let width = screen.size().1;
+        self.rows()
+            .filter_map(|row| {
+                let cols = self.span(row, width)?;
+                let mut line = String::new();
+                for col in cols {
+                    if let Some(cell) = screen.cell(row, col) {
+                        line.push_str(cell.contents());
+                    }
+                }
+                Some(line.trim_end().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -716,5 +826,57 @@ mod tests {
         overlay.dragging = true;
         assert!(end(&mut overlay));
         assert!(!overlay.dragging);
+    }
+
+    fn select(anchor: (u16, u16), head: (u16, u16)) -> Selection {
+        let mut selection = Selection::new(false, anchor.0, anchor.1);
+        selection.extend(head.0, head.1);
+        selection
+    }
+
+    #[test]
+    fn a_drag_selects_the_same_cells_from_either_direction() {
+        let forwards = select((0, 1), (2, 4));
+        let backwards = select((2, 4), (0, 1));
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards.rows(), 0..=2);
+
+        // The first row starts where the drag did and runs to the edge; the last
+        // one starts at the edge and *includes* the cell under the pointer.
+        assert_eq!(forwards.span(0, 20), Some(1..20));
+        assert_eq!(forwards.span(1, 20), Some(0..20));
+        assert_eq!(forwards.span(2, 20), Some(0..5));
+        assert_eq!(forwards.span(3, 20), None);
+
+        // Clamped to the grid, never past it.
+        assert_eq!(select((0, 18), (0, 30)).span(0, 20), Some(18..20));
+    }
+
+    #[test]
+    fn a_press_that_never_moved_is_a_click_not_a_selection() {
+        let click = select((4, 4), (4, 4));
+        assert!(!click.dragged());
+        // Its span is still one cell; the painter is what refuses to shade a click
+        // (see `render::Renderer::paint_selection`).
+        assert_eq!(click.span(4, 10), Some(4..5));
+    }
+
+    #[test]
+    fn the_copied_text_is_the_rows_without_their_padding() {
+        let mut parser = vt100::Parser::new(
+            crate::constants::nz(24),
+            crate::constants::nz(20),
+            0,
+        );
+        parser.process(b"hello world   \r\nsecond line\r\nthird");
+
+        let screen = parser.screen();
+        // "world" on the first row, all of "second line" on the next.
+        assert_eq!(select((0, 6), (1, 20)).text(screen), "world\nsecond line");
+        // Trailing blanks go; leading and inner ones stay.
+        assert_eq!(select((0, 0), (0, 20)).text(screen), "hello world");
+        assert_eq!(select((1, 0), (1, 5)).text(screen), "second");
+        // A whole screen with nothing selected on the last row.
+        assert_eq!(select((2, 0), (2, 20)).text(screen), "third");
     }
 }

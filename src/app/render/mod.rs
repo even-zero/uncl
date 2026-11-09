@@ -42,9 +42,12 @@
 //! `ui::owner::HostMouse`), and replaying `state_diff` would make the host start
 //! reporting in a protocol the child never asked for.
 
+use std::ops::Range;
+
 use vt100::Screen;
 
 use crate::app::images::Store;
+use crate::app::input::mouse::Selection;
 use crate::app::term::links::{Link, Links, OSC8_CLOSE};
 use crate::constants::{PIN_WIDTH, content_rect};
 use crate::geometry::Rect;
@@ -52,6 +55,8 @@ use crate::geometry::Rect;
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET: &[u8] = b"\x1b[0m";
+/// The selection's fill: reverse video over cells that keep their own colours.
+const REVERSE: &[u8] = b"\x1b[7m";
 /// The float's border while the float is up and focused: `#9acd32` (an RGB
 /// green), sent as a truecolor SGR sequence. Grey while the float is pinned and
 /// therefore unfocused.
@@ -93,6 +98,8 @@ pub struct Panes<'a> {
     pub float_title: Option<&'a str>,
     /// Is the float pinned? Its top-right corner shows `[■]` instead of `[ ]`.
     pub pinned: bool,
+    /// A text selection, in the coordinates of the pane it belongs to.
+    pub selection: Option<Selection>,
 }
 
 /// The hyperlinks each pane drew this frame (`OSC 8`, S3.5).
@@ -195,6 +202,7 @@ impl Renderer {
             focused_scrolled,
             float_title,
             pinned,
+            selection,
         } = panes;
         let float_at = float.as_ref().map(|(screen, rect)| (screen, *rect));
 
@@ -304,6 +312,12 @@ impl Renderer {
         let content = float_at.map(|(_, rect)| content_rect(rect));
         self.emit_images(images, content, repainted);
 
+        // The selection is painted over everything else and under the cursor,
+        // which is placed last so it cannot be dragged along by the highlight.
+        if let Some(selection) = selection {
+            self.paint_selection(selection, &owner, owner_area, float_at);
+        }
+
         if focused_scrolled {
             // Every line on screen is history; the child's cursor is somewhere
             // below it. Showing it would point at the wrong cell.
@@ -322,6 +336,76 @@ impl Renderer {
         self.force_full = false;
 
         &self.out
+    }
+
+    /// Shade a text selection over cells that are already on the screen.
+    ///
+    /// Deliberately not part of the row diff: a selection is a *view* of cells,
+    /// not a change to them, so a row whose cells are correct still needs its
+    /// highlight repainted after the child rewrites it. Re-emitting the selected
+    /// cells is idempotent, which is what makes an unchanged selection cost one
+    /// pass over its own rows per frame; the caller repaints the whole frame when
+    /// the selection *changes*, because a shrinking one would otherwise leave its
+    /// old edge shaded.
+    ///
+    /// Reverse video is the whole highlight. The pen is reset first: a row encoder
+    /// leaves its own pen set, and a selection shaded in whatever colour a status
+    /// bar ended on can be invisible.
+    fn paint_selection(
+        &mut self,
+        selection: Selection,
+        owner: &Screen,
+        owner_area: Rect,
+        float: Option<(&Screen, Rect)>,
+    ) {
+        // A press that never moved is a click: nothing to shade.
+        if !selection.dragged() {
+            return;
+        }
+
+        let (screen, area, covered) = match (selection.tenant, float) {
+            (true, Some((screen, rect))) => (screen, content_rect(rect), None),
+            // The float is gone; an invisible pane has nothing to shade.
+            (true, None) => return,
+            // A selection in the shell must not paint over the float drawn on top
+            // of it, so the float's rectangle is cut out of its rows.
+            (false, float) => (owner, owner_area, float.map(|(_, rect)| rect)),
+        };
+
+        for row in selection.rows() {
+            if row >= area.height {
+                break;
+            }
+            let Some(cols) = selection.span(row, area.width) else {
+                continue;
+            };
+
+            for span in unoccluded(cols, row, covered) {
+                self.paint_span(screen, area, row, span);
+            }
+        }
+
+        // The highlight moved the cursor and left a pen behind it.
+        self.cursor_at = None;
+    }
+
+    /// Re-emit one row's cells, shaded, where they already are.
+    fn paint_span(&mut self, screen: &Screen, area: Rect, row: u16, cols: Range<u16>) {
+        cup(
+            &mut self.out,
+            area.y.saturating_add(row),
+            area.x.saturating_add(cols.start),
+        );
+        self.out.extend_from_slice(RESET);
+        self.out.extend_from_slice(REVERSE);
+        for col in cols {
+            if let Some(cell) = screen.cell(row, col) {
+                // A wide character's second cell holds nothing: the glyph in the
+                // first one already advanced two columns.
+                self.out.extend_from_slice(cell.contents().as_bytes());
+            }
+        }
+        self.out.extend_from_slice(RESET);
     }
 
     /// Hide the cursor before painting: rows are drawn with `CUP` jumps, and a
@@ -1034,6 +1118,27 @@ fn cup(out: &mut Vec<u8>, row: u16, col: u16) {
     out.push(b'H');
 }
 
+/// The pieces of one row's selection that a rectangle does not cover.
+///
+/// A selection in the shell can be dragged under the float, and the float is
+/// painted on top of the shell: shading cells it covers would erase its border.
+fn unoccluded(cols: Range<u16>, row: u16, cover: Option<Rect>) -> Vec<Range<u16>> {
+    let Some(cover) = cover else {
+        return vec![cols];
+    };
+    if row < cover.y || row >= cover.bottom() {
+        return vec![cols];
+    }
+
+    [
+        cols.start..cols.end.min(cover.x),
+        cols.start.max(cover.right())..cols.end,
+    ]
+    .into_iter()
+    .filter(|span| span.start < span.end)
+    .collect()
+}
+
 /// `CSI n X`: erase `n` cells in place, without moving the cursor and without
 /// touching anything past them.
 fn erase_chars(out: &mut Vec<u8>, cells: u16) {
@@ -1278,6 +1383,7 @@ mod tests {
             focused_scrolled: false,
             float_title: None,
             pinned: false,
+            selection: None,
         });
 
         let frame = text(frame);
@@ -2546,5 +2652,85 @@ mod tests {
             vec![(0, 3), (3, 1), (4, 2), (6, 4)]
         );
         assert!(parts[0].2.is_some() && parts[1].2.is_none() && parts[2].2.is_some());
+    }
+
+    #[test]
+    fn a_shell_selection_is_clipped_to_the_float_on_top_of_it() {
+        let float = Rect::new(10, 1, 20, 3);
+
+        // A row the float does not reach is untouched.
+        assert_eq!(unoccluded(0..40, 0, Some(float)), vec![0..40]);
+        assert_eq!(unoccluded(0..40, 9, Some(float)), vec![0..40]);
+
+        // Inside its rows, the columns it covers are cut out of the span.
+        assert_eq!(unoccluded(0..40, 2, Some(float)), vec![0..10, 30..40]);
+        assert_eq!(unoccluded(12..20, 2, Some(float)), vec![] as Vec<Range<u16>>);
+        assert_eq!(unoccluded(0..5, 2, Some(float)), vec![0..5]);
+        // No float, no clipping.
+        assert_eq!(unoccluded(0..40, 2, None), vec![0..40]);
+    }
+
+    #[test]
+    fn a_selection_shades_its_cells_in_reverse_video() {
+        let mut parser = parser(3, 20);
+        parser.process(b"hello world");
+
+        let mut selection = Selection::new(false, 0, 6);
+        selection.extend(0, 10);
+
+        let mut renderer = Renderer::new();
+        let frame = text(renderer.render(Panes {
+            owner: parser.screen().clone(),
+            owner_area: Rect::new(0, 0, 20, 3),
+            float: None,
+            float_focused: false,
+            images: None,
+            links: FrameLinks::default(),
+            scroll: 0,
+            focused_scrolled: false,
+            float_title: None,
+            pinned: false,
+            selection: Some(selection),
+        }));
+
+        // The selected cells are re-emitted where they already are, shaded.
+        assert!(
+            frame.contains("\x1b[1;7H\x1b[0m\x1b[7mworld\x1b[0m"),
+            "frame: {frame:?}"
+        );
+        // Nothing before the selection and nothing after it is touched.
+        assert!(!frame.contains("\x1b[1;1H\x1b[0m\x1b[7mhello"), "frame: {frame:?}");
+        assert!(!frame.contains("\x1b[7m "), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn a_click_and_a_hidden_float_are_not_shaded() {
+        let mut parser = parser(3, 20);
+        parser.process(b"hello world");
+
+        let mut renderer = Renderer::new();
+        let mut render = |selection: Selection| {
+            text(renderer.render(Panes {
+                owner: parser.screen().clone(),
+                owner_area: Rect::new(0, 0, 20, 3),
+                float: None,
+                float_focused: false,
+                images: None,
+                links: FrameLinks::default(),
+                scroll: 0,
+                focused_scrolled: false,
+                float_title: None,
+                pinned: false,
+                selection: Some(selection),
+            }))
+        };
+
+        // A press that never moved: a click, not a selection of one cell.
+        assert!(!render(Selection::new(false, 0, 6)).contains("\x1b[7m"));
+
+        // A selection in a float that is not on screen has nothing to shade.
+        let mut hidden = Selection::new(true, 0, 6);
+        hidden.extend(0, 10);
+        assert!(!render(hidden).contains("\x1b[7m"));
     }
 }
