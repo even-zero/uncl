@@ -71,8 +71,21 @@ launched in:
   to the shell, exactly as in every other terminal.
 - uncl holds the mouse while it runs - that is how the float stays draggable, and
   how a click on a link gets resolved at all - so your terminal emulator's own
-  scrollback is not available inside uncl. uncl's is. `Shift`+drag still selects
-  text in most emulators, because they take that key back locally.
+  scrollback is not available inside uncl. uncl's is. see [the mouse](#the-mouse)
+  for handing the mouse back to the emulator.
+
+### the mouse
+
+uncl keeps the mouse while it runs: that is how the float is dragged and resized
+with it, how a click outside hides it, how the wheel reaches either pane's
+history, and how a click resolves a link. keeping it also means your terminal
+emulator never selects anything itself - it never sees a drag, so its own
+selection and scrollback cannot happen inside uncl.
+
+`UNCL_MOUSE=0 uncl` gives the mouse back. uncl then asks for nothing, and your
+terminal's own selection, copy and paste work exactly as they do outside uncl,
+in both panes, while uncl's mouse gestures rest: `[Home]` still toggles,
+`Alt`+arrows still move and resize, `Ctrl+Alt`+arrows still scroll.
 
 ## installing
 

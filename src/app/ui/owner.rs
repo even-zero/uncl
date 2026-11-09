@@ -102,6 +102,11 @@ impl Drop for TerminalGuard {
 /// mouse move becomes thousands of events per second. Specifically, always
 /// request SGR encoding so coordinates past 223 columns work, and only request
 /// any-motion (`?1003`) when the focused child actually asked for it.
+///
+/// Asking at all is what takes the mouse away from the host terminal, and with it
+/// the host's own selection. `UNCL_MOUSE=0` stops uncl asking (see
+/// `constants::mouse_grabbed`), which is the one way to get that selection back
+/// while uncl is on screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostMouse {
     Off,
@@ -167,6 +172,9 @@ pub struct Container {
     stop: Arc<AtomicBool>,
     /// The mouse mode we last asked the host for.
     host_mouse: HostMouse,
+    /// May uncl ask for the mouse at all? `UNCL_MOUSE=0` says no: the host keeps
+    /// its own selection, copy and paste, and uncl's mouse gestures go with it.
+    mouse: bool,
     /// The cursor style we last asked the host for (`DECSCUSR` parameter).
     cursor_style: u16,
     /// When the float's shell may be spawned again after a failure.
@@ -244,6 +252,7 @@ impl Container {
             signal: Signal::new(),
             stop: Arc::new(AtomicBool::new(false)),
             host_mouse: HostMouse::Off,
+            mouse: crate::constants::mouse_grabbed(),
             cursor_style: 0,
             tenant_retry_after: None,
             host_tx,
@@ -591,19 +600,30 @@ impl Container {
         }
     }
 
+    /// What to ask the host for, given what the focused child wants.
+    ///
+    /// With the mouse in uncl's hands it always wants at least a press: the wheel
+    /// is how either pane's history scrolls (a host that never reports the wheel
+    /// is a host uncl cannot scroll), the press is how the float is dragged and
+    /// how a click outside hides it, and the motion floor — button motion, not
+    /// bare press — is what makes a held border drag arrive as a drag. The cost is
+    /// deliberate: the host's own selection is unavailable while it holds nothing.
+    ///
+    /// `UNCL_MOUSE=0` is the way out. uncl asks for nothing, so the host keeps the
+    /// mouse and selects, copies and pastes exactly as it does outside uncl.
+    fn host_mouse(&self, modes: ChildModes) -> HostMouse {
+        if self.mouse {
+            HostMouse::for_modes(modes).at_least_press()
+        } else {
+            HostMouse::Off
+        }
+    }
+
     /// Ask the host for exactly the reporting the focused child needs.
     ///
     /// Re-sends only on change, so the steady state costs one comparison.
     fn sync_host_mouse(&mut self) {
-        // Always at least press: uncl has to see the wheel to give either pane a
-        // scrollback (a host that never reports the wheel is a host uncl cannot
-        // scroll), and while the float is up it has to see the press to drag it
-        // and to resolve its own hyperlinks. The floor is button motion, not bare
-        // press, so a held border drag really arrives as a drag. The cost is real
-        // and deliberate: the *host's* scrollback and mouse selection are
-        // unavailable unless the host overrides the grab (Shift+drag in most of
-        // them), because uncl now provides both itself.
-        let desired = HostMouse::for_modes(self.focused_modes()).at_least_press();
+        let desired = self.host_mouse(self.focused_modes());
 
         if desired == self.host_mouse {
             return;
@@ -1651,5 +1671,26 @@ mod tests {
         // first keeps a previous `?1003` state from leaking through.
         let expected: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1000h\x1b[?1006h";
         assert_eq!(HostMouse::ButtonMotion.sequence(), expected);
+    }
+
+    #[test]
+    fn uncl_mouse_zero_asks_the_host_for_nothing() {
+        let mut container = Container::new(true);
+        let modes = {
+            let mut parser = vt100::Parser::new(nz(4), nz(20), 0);
+            parser.process(b"\x1b[?1000h\x1b[?1006h");
+            ChildModes::from_screen(parser.screen())
+        };
+
+        // With the mouse (the default; `mouse_grabbed` is parsed and tested on
+        // its own), even a child that asked for a press-only protocol is lifted
+        // to button-motion, because uncl needs the drags.
+        container.mouse = true;
+        assert_eq!(container.host_mouse(modes), HostMouse::ButtonMotion);
+
+        // `UNCL_MOUSE=0`: uncl asks for nothing at all, and the host keeps the
+        // mouse — and with it its own selection, copy and paste.
+        container.mouse = false;
+        assert_eq!(container.host_mouse(modes), HostMouse::Off);
     }
 }

@@ -72,6 +72,37 @@ fn parse_scrollback(spec: &str) -> usize {
     spec.parse().unwrap_or(DEFAULT_SCROLLBACK)
 }
 
+/// Whether uncl asks the host terminal for the mouse, `UNCL_MOUSE`.
+///
+/// Asked for by default, because every mouse gesture uncl has is built on it: the
+/// float is dragged and resized by mouse, a click outside hides it, the wheel is
+/// what scrolls either pane's history, and a click is what resolves a hyperlink.
+/// None of that can arrive from a host that kept the mouse to itself.
+///
+/// Asking is also what stops the host selecting anything — a host that has handed
+/// the mouse over does not select on a drag, and its paste shortcut is all that is
+/// left of its clipboard handling. `UNCL_MOUSE=0` gives the mouse back: uncl then
+/// asks for nothing, and the host terminal's own selection, copy and paste work
+/// exactly as they do outside uncl, in both panes, at the price of the gestures
+/// above (which all have keyboard equivalents: `Home`, `Alt`+arrows,
+/// `Ctrl+Alt`+arrows).
+pub fn mouse_grabbed() -> bool {
+    match std::env::var("UNCL_MOUSE") {
+        Ok(spec) => parse_mouse(&spec),
+        Err(_) => true,
+    }
+}
+
+/// `UNCL_MOUSE`, kept separate so the parsing is testable without touching the
+/// process environment.
+///
+/// Only `0` gives the mouse back. Anything else — including a typo — keeps the
+/// default, because losing the mouse unasked would take the interface's own
+/// gestures away without saying so.
+fn parse_mouse(spec: &str) -> bool {
+    spec.trim() != "0"
+}
+
 /// Minimum time between frames (~120 Hz).
 ///
 /// A child flooding output raises the reader signal far more often than a
@@ -152,6 +183,16 @@ mod tests {
         // A pane that keeps no history cannot be scrolled, and one that keeps a
         // hundred thousand lines is a memory leak with a nice name.
         assert!((1_000..=10_000).contains(&DEFAULT_SCROLLBACK));
+    }
+
+    #[test]
+    fn only_a_plain_zero_hands_the_mouse_back() {
+        assert!(!parse_mouse("0"));
+        assert!(!parse_mouse(" 0 "));
+        // Everything else keeps uncl's own gestures, including nonsense.
+        for spec in ["", "1", "on", "off", "false", "no", "2", "0.0"] {
+            assert!(parse_mouse(spec), "{spec:?} must keep the mouse");
+        }
     }
 
     #[test]

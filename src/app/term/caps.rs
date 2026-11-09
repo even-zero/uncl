@@ -331,7 +331,7 @@ impl Capabilities {
     /// A few lines for `uncl doctor`.
     pub fn summary(&self) -> String {
         format!(
-            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)\n  child TERM={} ({})\n  images: {} ({}), over {}",
+            "TERM={} TERM_PROGRAM={} COLORTERM={}\n  truecolor={} sixel={} kitty_graphics={} kitty_keyboard={}\n  image tap: kitty + iTerm2 always, sixel {} (UNCL_SIXEL)\n  cell size: {}x{} px ({}), reported to children as CSI 16t (UNCL_CELL_PX)\n  hyperlinks: OSC 8 carried inside the float; FORCE_HYPERLINK=1 for children\n  scrollback: {} lines per pane, in both panes (UNCL_SCROLLBACK)\n  mouse: {} (UNCL_MOUSE)\n  child TERM={} ({})\n  images: {} ({}), over {}",
             if self.term.is_empty() { "<unset>" } else { &self.term },
             self.term_program.as_deref().unwrap_or("<unset>"),
             self.colorterm.as_deref().unwrap_or("<unset>"),
@@ -344,6 +344,11 @@ impl Capabilities {
             cell_px().1,
             cell_px_source(),
             crate::constants::scrollback_lines(),
+            if crate::constants::mouse_grabbed() {
+                "uncl's (drag/resize/click-away/wheel); 0 gives it to the host"
+            } else {
+                "the host's: its own selection and copy work; uncl asks for nothing"
+            },
             self.child_term(),
             if self.child_term() == self.term.as_str() {
                 "the host's own"
