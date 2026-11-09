@@ -17,6 +17,9 @@
 //!   gesture started inside the child's grid, in which case the child keeps it
 //!   until the button comes up. Losing that `Up` is what leaves a selection
 //!   stuck.
+//! * a drag on a pane whose child did not ask for the mouse → a [`Selection`] of
+//!   that pane's text. The child comes first, so a TUI that draws its own
+//!   selection keeps it.
 //!
 //! Everything here is pure geometry plus a little drag state, which keeps the
 //! routing decisions testable.
@@ -131,7 +134,7 @@ pub fn route(overlay: &Overlay, m: MouseEvent) -> MouseRoute {
 
 /// Convert a screen position into a zero-based cell inside `content`, clamping
 /// the pointer to the grid so off-grid drags still land on the nearest cell.
-fn local_point(content: Rect, column: u16, row: u16) -> (u16, u16) {
+pub fn local_point(content: Rect, column: u16, row: u16) -> (u16, u16) {
     let max_col = content.right().saturating_sub(1).max(content.x);
     let max_row = content.bottom().saturating_sub(1).max(content.y);
     (
@@ -288,6 +291,131 @@ pub fn end(overlay: &mut Overlay) -> bool {
     was_active
 }
 
+/// A drag selection inside one pane, in that pane's *document* coordinates.
+///
+/// Row 0 is the top row of the pane's live grid and negative rows are history, so
+/// the selection is glued to the text rather than to the screen: scrolling moves
+/// the highlight across the grid together with the lines it covers, instead of
+/// sliding it over whatever happens to be on screen. That is also what lets a drag
+/// past an edge keep going — the pane scrolls a line per event and the moving end
+/// stays on the edge — so a selection reaches as far back as the scrollback does,
+/// not just as far as the viewport.
+///
+/// It belongs to exactly one pane: it starts where the press landed and can never
+/// spill into the other one, which is why `tenant` is part of it rather than being
+/// derived per row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    /// The float, or the shell behind it.
+    pub tenant: bool,
+    /// Where the press landed: `(column, row)`.
+    pub anchor: (u16, i32),
+    /// Where the moving end is now.
+    pub focus: (u16, i32),
+}
+
+impl Selection {
+    /// A fresh selection at `cell`, a pane-local `(column, row)` of a pane
+    /// scrolled back by `scroll`.
+    pub fn new(tenant: bool, cell: (u16, u16), scroll: usize) -> Self {
+        let cell = document(cell, scroll);
+        Self {
+            tenant,
+            anchor: cell,
+            focus: cell,
+        }
+    }
+
+    /// Move the moving end to `cell`, in the same pane-local view coordinates.
+    pub fn extend(&mut self, cell: (u16, u16), scroll: usize) {
+        self.focus = document(cell, scroll);
+    }
+
+    /// Move the moving end onto the line at the pane's edge, keeping its column.
+    ///
+    /// Used when the wheel scrolls the pane mid-drag: the line under the pointer
+    /// is a different one now, so the selection takes the line that replaced it
+    /// rather than ending.
+    pub fn extend_row(&mut self, row: u16, scroll: usize) {
+        self.focus = (self.focus.0, i32::from(row) - offset(scroll));
+    }
+
+    /// Did the pointer move at all? A press and release on one cell is a click,
+    /// not a selection.
+    pub fn is_drag(&self) -> bool {
+        self.anchor != self.focus
+    }
+
+    /// The document rows the selection covers, top to bottom, with the columns on
+    /// each: `(row, from, to)`, `to` exclusive.
+    ///
+    /// The rows between the two ends are taken whole, which is what a multi-line
+    /// selection is everywhere: dragging from the middle of one line to the middle
+    /// of another covers the ends of the lines in between.
+    pub fn lines(&self, cols: u16) -> impl Iterator<Item = (i32, u16, u16)> {
+        let (first, last) = self.ends();
+        (first.1..=last.1).map(move |row| {
+            let (from, to) = span(first, last, row, cols);
+            (row, from, to)
+        })
+    }
+
+    /// The same rows in the coordinates of a pane of `rows` lines scrolled back by
+    /// `scroll`: `(visible_row, from, to)`, with everything off screen dropped.
+    ///
+    /// This is the whole of what a selection has to know about scrollback: the
+    /// rows that are not on screen are simply not painted, and they are still in
+    /// the selection when it is copied.
+    pub fn visible(&self, scroll: usize, rows: u16, cols: u16) -> Vec<(u16, u16, u16)> {
+        self.lines(cols)
+            .filter_map(|(row, from, to)| {
+                let visible = u16::try_from(view_row(row, scroll)).ok()?;
+                (visible < rows && from < to).then_some((visible, from, to))
+            })
+            .collect()
+    }
+
+    /// The two ends in reading order: the top-left one first.
+    fn ends(&self) -> ((u16, i32), (u16, i32)) {
+        let (anchor, focus) = (self.anchor, self.focus);
+        if (anchor.1, anchor.0) <= (focus.1, focus.0) {
+            (anchor, focus)
+        } else {
+            (focus, anchor)
+        }
+    }
+}
+
+/// A pane-local `(column, row)` as a document cell: a pane scrolled back by
+/// `scroll` lines shows document row `-scroll` at its top.
+fn document(cell: (u16, u16), scroll: usize) -> (u16, i32) {
+    (cell.0, i32::from(cell.1) - offset(scroll))
+}
+
+/// A document row as a row of the same pane's visible grid, the inverse of
+/// [`document`]: a pane scrolled back by `scroll` shows history *below* its top
+/// edge, so the offset is added back.
+fn view_row(row: i32, scroll: usize) -> i32 {
+    row + offset(scroll)
+}
+
+/// A scroll offset as the signed document coordinate above.
+fn offset(scroll: usize) -> i32 {
+    i32::try_from(scroll).unwrap_or(i32::MAX)
+}
+
+/// The columns a selection covers on one of its rows.
+fn span(first: (u16, i32), last: (u16, i32), row: i32, cols: u16) -> (u16, u16) {
+    let from = (if row == first.1 { first.0 } else { 0 }).min(cols);
+    let to = (if row == last.1 {
+        last.0.saturating_add(1)
+    } else {
+        cols
+    })
+    .min(cols);
+    (from, to.max(from))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +450,55 @@ mod tests {
             row,
             modifiers: KeyModifiers::CONTROL,
         }
+    }
+
+    #[test]
+    fn a_selection_covers_the_ends_and_the_whole_rows_between_them() {
+        let mut selection = Selection::new(false, (2, 1), 0);
+        selection.extend((4, 3), 0);
+        assert!(selection.is_drag());
+        assert!(!selection.tenant);
+        assert_eq!(
+            selection.lines(10).collect::<Vec<_>>(),
+            [(1, 2, 10), (2, 0, 10), (3, 0, 5)]
+        );
+    }
+
+    #[test]
+    fn a_selection_dragged_upwards_is_read_top_down() {
+        let mut selection = Selection::new(true, (5, 4), 0);
+        selection.extend((1, 2), 0);
+        // The moving end is now above the press, so the top row is the short one
+        // and the bottom row runs to the press.
+        assert_eq!(
+            selection.lines(8).collect::<Vec<_>>(),
+            [(2, 1, 8), (3, 0, 8), (4, 0, 6)]
+        );
+    }
+
+    #[test]
+    fn a_click_is_not_a_selection() {
+        let selection = Selection::new(false, (4, 4), 0);
+        assert!(!selection.is_drag());
+    }
+
+    #[test]
+    fn a_selection_stays_on_its_text_while_the_pane_scrolls() {
+        // Pressed on the live screen at (0, 1); dragged to (3, 0) after the pane
+        // had to scroll two lines to follow the pointer.
+        let mut selection = Selection::new(false, (0, 1), 0);
+        selection.extend((3, 0), 2);
+
+        // Two lines back, the whole selection is on screen.
+        assert_eq!(
+            selection.visible(2, 11, 10),
+            [(0, 3, 10), (1, 0, 10), (2, 0, 10), (3, 0, 1)]
+        );
+        // Back on the live view the history half is above the top edge, so only
+        // the live row is painted.
+        assert_eq!(selection.visible(0, 11, 10), [(0, 0, 10), (1, 0, 1)]);
+        // A pane shorter than the selection paints only the rows it has.
+        assert_eq!(selection.visible(2, 2, 10), [(0, 3, 10), (1, 0, 10)]);
     }
 
     #[test]

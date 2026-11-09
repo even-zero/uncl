@@ -199,6 +199,9 @@ Alt+drag / border press  >  child (if a gesture is in progress)  >  child (conte
 | inside the content rect | `Child { col, row }` | the child's coordinates, encoded for the child's protocol |
 | outside the float | `HideFloat` | click away to hide |
 
+A press the child declined (its mouse reporting is off — every shell) also starts a
+selection of *that* pane's text. A child that asked for the mouse keeps its drags.
+
 A gesture that *starts* in the child's grid belongs to the child until the button
 comes up, even if the pointer leaves the float — `Overlay::child_grab` records that,
 and out-of-grid coordinates are clamped to the nearest cell, which is what a real
@@ -219,8 +222,8 @@ button-press always (uncl needs it to move the float, hide it on a click outside
 and resolve hyperlinks), motion only when the focused child asked for it, and
 everything off when nobody wants it. The trade-off is explicit: the host's own
 scrollback and click-drag selection are unavailable inside uncl, because uncl
-provides both. `Shift`+drag still selects in most emulators, which take that key
-back locally.
+provides both — see *The selection* below. `UNCL_MOUSE=0` gives the mouse back to
+the host, at the price of every gesture uncl builds on it.
 
 **Focus and cursor shape are relayed.** `?1004` is tracked (the parser does not model
 it) and focus in/out is sent to whichever pane gains or loses the keyboard. The
@@ -229,7 +232,8 @@ insert-mode beam is a beam.
 
 **The chords.** `Home` toggles the float. `Alt`+arrows move it, `Alt`+Shift+arrows
 resize it. `Ctrl+Alt+q` quits. `Ctrl+Alt+Up/Down` and `Ctrl+Alt+PageUp/PageDown`
-scroll the focused pane. Everything else is delivered to whichever pane owns the
+scroll the focused pane. `Ctrl+C` copies the selection and `Ctrl+V` pastes, and both
+fall through to the child when there is nothing for them to do. Everything else is delivered to whichever pane owns the
 keyboard.
 
 **A crashing float cannot take the owner down.** The float's shell exiting closes
@@ -497,6 +501,42 @@ almost certainly a copied file). An empty clipboard is still an answer from the
 program that owned the selection; with no helper installed the request stays
 unanswered, which is what a child's timeout is for. Selectors `c`, `p` and `s` are
 served; cut buffers and compound selectors are refused before anything is spawned.
+
+---
+
+## The selection
+
+A drag on a pane whose child did not ask for the mouse selects that pane's text, and
+only that pane's: the press records which pane it landed in, and the moving end can
+never cross into the other one.
+
+The selection is kept in **document** coordinates — row 0 is the pane's live top row
+and negative rows are history — so it is glued to the text rather than to the screen.
+Scrolling moves the highlight with the lines it covers, and a drag past an edge (or
+onto the pane's own first/last line, which is all the room the full-screen owner pane
+has) scrolls that pane a line per event and keeps the moving end on the edge, so a
+selection reaches as far back as the scrollback does. A wheel tick during a drag
+scrolls and extends instead of ending the selection. Anything else ends it — a press
+anywhere, and any key: the highlight is a set of *document* rows, so one left behind
+would sit on whatever arrived after the drag and paint those fresh cells as
+selected.
+
+Painting is a span of reverse video per row, emitted by `emit_selected_row` as up to
+three `rows_formatted` pieces (before, inside, after) — the same trick
+`emit_row_segments` uses for `OSC 8`, and for the same reason: the span's columns are
+known while a byte offset inside an encoded row is not. `vt100` writes a bare `SGR 0`
+before every plain cell, which would switch the reverse video off mid-span, so the
+selected piece has it re-asserted after each reset.
+
+The renderer cannot see a highlight in the cell diff (reverse video is not part of a
+cell), so it remembers the previous frame's `Highlight` and repaints the union of the
+rows it covered then and the rows it covers now. Copying walks the selected document
+rows on a *clone* of the pane's screen, scrolling it with `set_scrollback` to reach the
+rows that are off screen, and trims each row's trailing blanks. The text goes to the
+desktop first — `wl-copy`/`xclip`/`xsel`/`pbcopy` carry all of it — and to the host
+terminal over `OSC 52` only when that can hold the copy whole: terminals cap the
+sequence (a multiplexer in between caps it harder) and a capped write does not fail,
+it lands cut in half, which is a clipboard that pastes a fragment.
 
 ---
 

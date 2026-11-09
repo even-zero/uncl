@@ -464,7 +464,10 @@ fn help() {
          Alt+arrows         move it\n  \
          Alt+Shift+arrows   resize it\n  \
          Alt+drag           move it with the mouse\n  \
-         border drag        resize it with the mouse\n\n\
+         border drag        resize it with the mouse\n  \
+         drag               select text in the pane the drag starts in\n  \
+         Ctrl+C             copy the selection (otherwise the shell's interrupt)\n  \
+         Ctrl+V             paste the clipboard\n\n\
          nesting:\n  \
          uncl does not nest: running it in the background shell toggles the float\n  \
          exactly like Home, and running it inside the float is refused with a\n  \
