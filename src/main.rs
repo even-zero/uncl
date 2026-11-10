@@ -438,8 +438,6 @@ fn doctor() {
     // Every input to the nesting decision, and its verdict: a multiplexer
     // between the panes hides the role marker, so a surprising refusal is only
     // diagnosable if the inputs are visible.
-    println!("nesting: {}", Nesting::get());
-    println!();
     println!("notes:");
     println!("  * TERM is passed through from the host, downgraded to xterm-256color for");
     println!("    screen/tmux (a dialect uncl does not speak) and xterm-kitty (its TERM");
@@ -468,10 +466,6 @@ fn help() {
          drag               select text in the pane the drag starts in\n  \
          Ctrl+C             copy the selection (otherwise the shell's interrupt)\n  \
          Ctrl+V             paste the clipboard\n\n\
-         nesting:\n  \
-         uncl does not nest: running it in the background shell toggles the float\n  \
-         exactly like Home, and running it inside the float is refused with a\n  \
-         message instead of opening a terminal in a terminal.\n\n\
          everything else is delivered to whichever terminal has focus.",
         env!("CARGO_PKG_VERSION")
     );
