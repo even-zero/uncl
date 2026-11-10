@@ -2,7 +2,7 @@
 ░█░█░█▀█░█▀▀░█░░
 ░█░█░█░█░█░░░█░░
 ░▀▀▀░▀░▀░▀▀▀░▀▀▀
-v0.1.11
+v0.1.12
 ```
 
 [![release-badge](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
@@ -25,8 +25,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - no nesting: running `uncl` again in the background shell toggles the float,
   and running it inside the float is refused with a message
 - pin the float in place with the `[ ]`: a pinned float stays on screen while you
-  type in the shell behind it, and running `uncl` again in that shell raises it
-  back into the keyboard instead of putting it away
+  type in the shell behind it
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
