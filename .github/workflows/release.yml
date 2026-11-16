@@ -396,6 +396,10 @@ jobs:
   # The crates.io upload needs a `CARGO_REGISTRY_TOKEN` repository secret: an API
   # token from https://crates.io/settings/access-tokens with permission to
   # publish `uncl`.
+  #
+  # The crate is uploaded before the draft is made public: if the upload fails,
+  # the draft stays unpublished and a re-run picks it up again, so a public
+  # release is never missing from crates.io.
   # ---------------------------------------------------------------------------
   publish:
     name: publish the newest draft
@@ -446,22 +450,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.draft.outputs.published == 'true'
 
-      - name: publish
-        if: steps.draft.outputs.published == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.draft.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          echo "publishing $TAG"
-          # This is the step that creates the tag and makes the release public.
-          gh release edit "$TAG" --draft=false --latest
-
-          gh release view "$TAG" --json tagName,isDraft,url \
-            -q '"published " + .tagName + " (" + .url + ")"'
-
       - name: publish to crates.io
         if: steps.draft.outputs.published == 'true'
         env:
@@ -497,3 +485,19 @@ jobs:
           fi
 
           cargo publish --locked
+
+      - name: publish
+        if: steps.draft.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "publishing $TAG"
+          # This is the step that creates the tag and makes the release public.
+          gh release edit "$TAG" --draft=false --latest
+
+          gh release view "$TAG" --json tagName,isDraft,url \
+            -q '"published " + .tagName + " (" + .url + ")"'
