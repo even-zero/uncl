@@ -29,7 +29,7 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - floating term is draggable and resizeable with mouse
 - floating term is draggable and resizeable with keyboard
 - supports most shells, tested on zsh, bash
-- supports most terminal emulators, tested on Wezterm, Xfce Terminal
+- supports most terminal emulators, tested on Wezterm, Xfce Terminal, Ghostty, Alacritty etc.
 - images render inside the float
 - clickable links inside the float
 - scrollback in both panes
@@ -38,66 +38,6 @@ uncl is a terminal monoplexer - a single, toggleable, resizeable, and draggable 
 - children get your terminal's `TERM` (alacritty, foot, wezterm, xterm...), and
   `xterm-256color` where uncl cannot carry what that `TERM` implies: `screen`/
   `tmux` dialects, and kitty's keyboard protocol. `uncl --doctor` prints both
-
-### images: caveats
-
-uncl does not decode, scale or re-encode anything. The child's bytes are carried
-through to your terminal and re-emitted inside the float, so what you get is
-whatever your terminal can do:
-
-- kitty graphics and iTerm2 inline images work out of the box.
-- sixel is opt-in (`UNCL_SIXEL=1`) and only on a terminal that can draw it.
-- an image too big for the float is scaled down to fit it (by your terminal - the
-  bytes are passed through untouched), keeping its aspect ratio. Small images are
-  never scaled up. uncl measures your cell size from the tty at startup and
-  reports it to children; `UNCL_CELL_PX=WxH` overrides the measurement and
-  `uncl --doctor` prints it.
-- sixel images larger than the float are skipped, once, with a note on stderr:
-  sixel has no way to ask for a size, and uncl never re-encodes.
-- no animation, no alpha, no scaling, no re-encoding.
-- the background shell's images are not carried through - only the float's.
-
-### scrollback
-
-both panes keep history, and the size is inherited from the environment uncl was
-launched in:
-
-- `UNCL_SCROLLBACK=10000 uncl` keeps 10,000 lines per pane (the default is 2,000).
-  `UNCL_SCROLLBACK=0` turns history off. Anything that is not plain digits is
-  ignored in favour of the default - uncl does not guess at memory.
-- the wheel scrolls the pane under the pointer. while the float is scrolled back
-  its border shows how far (`s:24:80 +12`), and `Ctrl+Alt+Up/Down` scrolls a notch
-  and `Ctrl+Alt+PageUp/PageDown` a screenful for terminals without a wheel.
-- typing anything puts the view back on the live screen; the keystroke still goes
-  to the shell, exactly as in every other terminal.
-- uncl holds the mouse while it runs - that is how the float stays draggable, and
-  how a click on a link gets resolved at all - so your terminal emulator's own
-  scrollback is not available inside uncl. uncl's is. see [the mouse](#the-mouse)
-  for handing the mouse back to the emulator.
-
-### the mouse
-
-uncl keeps the mouse while it runs: that is how the float is dragged and resized
-with it, how a click outside hides it, how the wheel reaches either pane's
-history, and how a click resolves a link.
-
-dragging over a pane's text selects it, in that pane only. the selection is
-anchored to the text and not to the screen: dragging past the top or bottom edge
-scrolls that pane and keeps going, as far back as its scrollback reaches, and
-scrolling afterwards moves the highlight along with the lines it covers. clicking
-anywhere - in it, outside it, in the other pane - or pressing any key drops it: the
-highlight is history's rows, and one left behind would be painting whatever arrived
-since. `Ctrl+C` copies it and `Ctrl+V` pastes; with nothing selected `Ctrl+C`
-is the shell's interrupt again. the copy goes through `wl-copy`/`xclip`/`xsel`/
-`pbcopy` where they exist, and to your terminal over `OSC 52` otherwise - which is
-the one with a size limit: terminals cap it (and a multiplexer in between caps it
-harder), so a very large copy is only whole when one of those programs is
-installed. a TUI that asked for the mouse keeps its own drags, selection included
-- the child always comes first.
-
-`UNCL_MOUSE=0 uncl` gives the mouse back instead: uncl asks for nothing, and your
-terminal's own selection, copy and paste work exactly as they do outside uncl, at
-the price of the gestures above.
 
 ## installing
 
@@ -131,10 +71,3 @@ if [[ -z "$UNCL_STARTED" ]]; then
 fi
 ```
 
-## releases
-
-`dev` is where work lands and `main` is the switch. a push to `dev` that changes
-`src/`, `Cargo.toml` or `Cargo.lock` runs the tests, bumps the patch version,
-builds every platform, and replaces the **draft** release - nothing is visible
-yet. a push to `main` publishes that draft, which is the moment the tag appears.
-a `dev` push that only touches docs or the readme does nothing.
