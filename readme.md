@@ -2,7 +2,7 @@
 ░█░█░█▀█░█▀▀░█░░
 ░█░█░█░█░█░░░█░░
 ░▀▀▀░▀░▀░▀▀▀░▀▀▀
-v0.1.13
+v0.1.14
 ```
 
 [![release-badge](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
