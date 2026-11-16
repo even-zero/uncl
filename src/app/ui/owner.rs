@@ -151,10 +151,16 @@ impl HostMouse {
             // never asked for.
             HostMouse::Off => b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l",
             HostMouse::Press => b"\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h",
+            // Mouse tracking modes are mutually exclusive in terminals that
+            // implement the xterm protocol: the last enabled tracking mode wins.
+            // Enable the base press mode first and the desired motion mode last;
+            // otherwise ?1000h can silently downgrade ?1002h/?1003h to press-only.
             HostMouse::ButtonMotion => {
-                b"\x1b[?1003l\x1b[?1002h\x1b[?1000h\x1b[?1006h"
+                b"\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1002h\x1b[?1006h"
             }
-            HostMouse::AnyMotion => b"\x1b[?1003h\x1b[?1002h\x1b[?1000h\x1b[?1006h",
+            HostMouse::AnyMotion => {
+                b"\x1b[?1002l\x1b[?1000h\x1b[?1003h\x1b[?1006h"
+            },
         }
     }
 }
@@ -2276,10 +2282,11 @@ mod tests {
 
     #[test]
     fn the_button_motion_sequence_enables_press_and_drag_tracking() {
-        // Enable press reporting and SGR encoding, and turn on button-motion
-        // tracking so a held press produces drag events. Disabling any-motion
-        // first keeps a previous `?1003` state from leaking through.
-        let expected: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1000h\x1b[?1006h";
+        // Enable press reporting before button-motion tracking: tracking modes
+        // are mutually exclusive and the final enabled mode must be `?1002`.
+        // Disabling any-motion first keeps a previous `?1003` state from leaking.
+        let expected: &[u8] =
+            b"\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
         assert_eq!(HostMouse::ButtonMotion.sequence(), expected);
     }
 
