@@ -432,10 +432,25 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
+      # Check out before touching the release: `gh release edit` shells out to
+      # git when publishing a draft, so the workspace must be a repository. And
+      # the crate on crates.io must be the same commit whose binaries shipped,
+      # so use the draft's target rather than the trigger.
+      - uses: actions/checkout@v4
+        if: steps.draft.outputs.published == 'true'
+        with:
+          ref: ${{ steps.draft.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.draft.outputs.published == 'true'
+
       - name: publish
         if: steps.draft.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.draft.outputs.tag }}
         run: |
           set -euo pipefail
@@ -446,16 +461,6 @@ jobs:
 
           gh release view "$TAG" --json tagName,isDraft,url \
             -q '"published " + .tagName + " (" + .url + ")"'
-
-      # The crate on crates.io must be the same commit whose binaries shipped in
-      # the release, so check out the draft's target rather than the trigger.
-      - uses: actions/checkout@v4
-        if: steps.draft.outputs.published == 'true'
-        with:
-          ref: ${{ steps.draft.outputs.sha }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.draft.outputs.published == 'true'
 
       - name: publish to crates.io
         if: steps.draft.outputs.published == 'true'
