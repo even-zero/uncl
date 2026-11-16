@@ -36,6 +36,76 @@ use crate::constants::PTY_WRITE_BATCH;
 /// A child's grid, with the callbacks that answer its terminal queries.
 pub type ChildParser = vt100::Parser<ChildCallbacks>;
 
+/// `vt100` 0.18.1 handles DEC cursor save/restore (`ESC 7` / `ESC 8`) but
+/// not the equivalent CSI forms (`CSI s` / `CSI u`) used by applications such
+/// as btop. Translate only those parameterless sequences before parsing, so
+/// the parser's own per-grid cursor-save state remains authoritative.
+#[derive(Debug, Default)]
+struct CursorSaveRestore {
+    pending: Vec<u8>,
+}
+
+impl CursorSaveRestore {
+    /// Feed a chunk, retaining a partial ESC/CSI sequence across PTY reads.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        const MAX_CSI: usize = 4096;
+        let mut out = Vec::with_capacity(bytes.len());
+
+        for &byte in bytes {
+            if self.pending.is_empty() {
+                if byte == 0x1b {
+                    self.pending.push(byte);
+                } else {
+                    out.push(byte);
+                }
+            } else if self.pending.as_slice() == b"\x1b" {
+                if byte == b'[' {
+                    self.pending.push(byte);
+                } else {
+                    out.push(0x1b);
+                    self.pending.clear();
+                    if byte == 0x1b {
+                        self.pending.push(byte);
+                    } else {
+                        out.push(byte);
+                    }
+                }
+            } else {
+                // A new ESC cancels an incomplete CSI in the terminal
+                // grammar. Pass the old sequence through and start tracking
+                // the new escape rather than buffering indefinitely.
+                if byte == 0x1b {
+                    out.append(&mut self.pending);
+                    self.pending.push(byte);
+                    continue;
+                }
+
+                self.pending.push(byte);
+                if (0x40..=0x7e).contains(&byte) {
+                    if self.pending.as_slice() == b"\x1b[s" {
+                        out.extend_from_slice(b"\x1b7");
+                    } else if self.pending.as_slice() == b"\x1b[u" {
+                        out.extend_from_slice(b"\x1b8");
+                    } else {
+                        out.extend_from_slice(&self.pending);
+                    }
+                    self.pending.clear();
+                } else if self.pending.len() >= MAX_CSI {
+                    out.append(&mut self.pending);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Preserve stream order if a non-text (out-of-band) piece interrupts an
+    /// incomplete escape sequence.
+    fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 /// Everything the UI needs to talk to a spawned child.
 pub struct PtySession {
     /// Bytes destined for the child's stdin. Unbounded: sending must never
@@ -151,6 +221,7 @@ pub fn spawn(
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8192];
         let mut splitter = Splitter::new();
+        let mut cursor_sequences = CursorSaveRestore::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -158,8 +229,20 @@ pub fn spawn(
                     for piece in splitter.feed(&buf[..n]) {
                         let mut parser = parser.write().unwrap();
                         match piece {
-                            Piece::Text(bytes) => parser.process(&bytes),
+                            Piece::Text(bytes) => {
+                                let normalized = cursor_sequences.feed(&bytes);
+                                if !normalized.is_empty() {
+                                    parser.process(&normalized);
+                                }
+                            }
                             Piece::OutOfBand(kind, bytes) => {
+                                // Keep an incomplete ordinary escape sequence
+                                // ahead of this out-of-band sequence in parser
+                                // order. Valid CSI sequences cannot contain one.
+                                let pending = cursor_sequences.flush();
+                                if !pending.is_empty() {
+                                    parser.process(&pending);
+                                }
                                 // `DCS` is the one family the parser cannot answer
                                 // for itself: `vt100` implements no `DCS` at all, so
                                 // a `DECRQSS`/`XTGETTCAP` would vanish and its sender
@@ -264,4 +347,44 @@ pub fn spawn(
         exited: exited_rx,
         killer,
     })
+}
+
+#[cfg(test)]
+mod cursor_save_restore_tests {
+    use super::CursorSaveRestore;
+    use std::num::NonZeroU16;
+
+    #[test]
+    fn normalizes_cursor_save_restore_even_when_split_across_reads() {
+        let mut filter = CursorSaveRestore::default();
+        assert_eq!(filter.feed(b"before\x1b["), b"before");
+        assert_eq!(filter.feed(b"safter\x1b[u!"), b"\x1b7after\x1b8!");
+        assert!(filter.flush().is_empty());
+    }
+
+    #[test]
+    fn preserves_other_and_parameterized_csi_sequences() {
+        let mut filter = CursorSaveRestore::default();
+        let input = b"\x1b[2;4s\x1b[1u\x1b[31m";
+        assert_eq!(filter.feed(input), input);
+    }
+
+    #[test]
+    fn parser_restores_cursor_for_btop_style_dialog_lines() {
+        let mut filter = CursorSaveRestore::default();
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(6).unwrap(),
+            NonZeroU16::new(12).unwrap(),
+            0,
+        );
+        let bytes = b"\x1b[2;3H\x1b[s\x1b[5;8HXY\x1b[uZ";
+        let normalized = filter.feed(bytes);
+        parser.process(&normalized);
+
+        let screen = parser.screen();
+        assert_eq!(screen.cell(4, 7).contents(), "X");
+        assert_eq!(screen.cell(4, 8).contents(), "Y");
+        assert_eq!(screen.cell(1, 2).contents(), "Z");
+        assert_eq!(screen.cursor_position(), (1, 3));
+    }
 }
