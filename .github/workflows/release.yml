@@ -2,8 +2,10 @@ name: release
 
 #   dev  -> test, bump the patch version, build every platform, replace the
 #           *draft* release. The draft is not visible until someone publishes it.
-# master -> publish the newest draft. Publishing is the only step that creates
-#           the tag and makes a release visible, so `master` stays the switch.
+# master -> publish the newest draft, then push the same version to crates.io so
+#           `cargo install uncl` picks it up. Publishing is the only step that
+#           creates the tag and makes a release visible, so `master` stays the
+#           switch.
 #
 # The version lives in Cargo.toml and is bumped in a commit pushed back to the
 # branch, so the repository always says which version is being prepared.
@@ -390,6 +392,10 @@ jobs:
   # The publish half. Runs only on master (or when asked for by hand), and quits
   # quietly when no draft is waiting: merging master with nothing pending is a
   # normal thing to do, not a failure.
+  #
+  # The crates.io upload needs a `CARGO_REGISTRY_TOKEN` repository secret: an API
+  # token from https://crates.io/settings/access-tokens with permission to
+  # publish `uncl`.
   # ---------------------------------------------------------------------------
   publish:
     name: publish the newest draft
@@ -398,9 +404,12 @@ jobs:
       && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
           || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    # The crates.io upload compiles the crate from scratch, which is far slower
+    # than the release publish itself.
+    timeout-minutes: 30
     steps:
-      - name: publish
+      - name: find the newest draft
+        id: draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -414,12 +423,72 @@ jobs:
 
           if [ -z "$tag" ] || [ "$tag" = "null" ]; then
             echo "::notice::no draft release to publish; nothing to do"
+            echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "publishing $tag"
-          # This is the step that creates the tag and makes the release public.
-          gh release edit "$tag" --draft=false --latest
+          sha="$(gh release view "$tag" --json targetCommitish -q .targetCommitish)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
-          gh release view "$tag" --json tagName,isDraft,url \
+      - name: publish
+        if: steps.draft.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "publishing $TAG"
+          # This is the step that creates the tag and makes the release public.
+          gh release edit "$TAG" --draft=false --latest
+
+          gh release view "$TAG" --json tagName,isDraft,url \
             -q '"published " + .tagName + " (" + .url + ")"'
+
+      # The crate on crates.io must be the same commit whose binaries shipped in
+      # the release, so check out the draft's target rather than the trigger.
+      - uses: actions/checkout@v4
+        if: steps.draft.outputs.published == 'true'
+        with:
+          ref: ${{ steps.draft.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.draft.outputs.published == 'true'
+
+      - name: publish to crates.io
+        if: steps.draft.outputs.published == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # crates.io can take a while before it starts accepting the upload
+          # body, and cargo aborts transfers under 10 bytes/sec for 30s by
+          # default.
+          CARGO_HTTP_LOW_SPEED_LIMIT: "0"
+          CARGO_HTTP_TIMEOUT: "300"
+          TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is missing: add a crates.io API token to the repository secrets."
+            exit 1
+          fi
+
+          # The tag, the commit, and the manifest must all agree on the version.
+          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Cargo.toml says $manifest_version but the release is v$version."
+            exit 1
+          fi
+
+          # A re-run after a successful publish must not fail the job.
+          if curl -sf -H "User-Agent: cargo (github-actions)" \
+               "https://crates.io/api/v1/crates/uncl/$version" >/dev/null; then
+            echo "::notice::uncl v$version is already on crates.io; skipping"
+            exit 0
+          fi
+
+          cargo publish --locked
