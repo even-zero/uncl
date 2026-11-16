@@ -501,3 +501,49 @@ jobs:
 
           gh release view "$TAG" --json tagName,isDraft,url \
             -q '"published " + .tagName + " (" + .url + ")"'
+
+      # The crate on crates.io must be the same commit whose binaries shipped in
+      # the release, so check out the draft's target rather than the trigger.
+      - uses: actions/checkout@v4
+        if: steps.draft.outputs.published == 'true'
+        with:
+          ref: ${{ steps.draft.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.draft.outputs.published == 'true'
+
+      - name: publish to crates.io
+        if: steps.draft.outputs.published == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # crates.io can take a while before it starts accepting the upload
+          # body, and cargo aborts transfers under 10 bytes/sec for 30s by
+          # default.
+          CARGO_HTTP_LOW_SPEED_LIMIT: "0"
+          CARGO_HTTP_TIMEOUT: "300"
+          TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is missing: add a crates.io API token to the repository secrets."
+            exit 1
+          fi
+
+          # The tag, the commit, and the manifest must all agree on the version.
+          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Cargo.toml says $manifest_version but the release is v$version."
+            exit 1
+          fi
+
+          # A re-run after a successful publish must not fail the job.
+          if curl -sf -H "User-Agent: cargo (github-actions)" \
+               "https://crates.io/api/v1/crates/uncl/$version" >/dev/null; then
+            echo "::notice::uncl v$version is already on crates.io; skipping"
+            exit 0
+          fi
+
+          cargo publish --locked
