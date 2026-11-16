@@ -2,7 +2,7 @@
 ░█░█░█▀█░█▀▀░█░░
 ░█░█░█░█░█░░░█░░
 ░▀▀▀░▀░▀░▀▀▀░▀▀▀
-v0.1.13
+v0.1.14
 ```
 
 [![release-badge](https://github.com/even-zero/uncl/actions/workflows/release.yml/badge.svg)](https://github.com/even-zero/uncl/actions/workflows/release.yml)
@@ -51,7 +51,16 @@ unpack it and put `uncl` somewhere on your `PATH`.
   `xattr -d com.apple.quarantine uncl`, or right-click -> open in finder.
 - windows: windows 10 1809 or newer, for a console that speaks ansi.
 
-or build it, with a rust toolchain (edition 2024, so rust 1.85 or newer):
+or install with cargo:
+
+```sh
+cargo install uncl
+```
+
+this pulls the crate from crates.io, so you need a rust toolchain (edition 2024,
+so rust 1.85 or newer).
+
+or build it from source, with a rust toolchain:
 
 ```sh
 git clone https://github.com/even-zero/uncl && cd uncl
@@ -70,4 +79,3 @@ if [[ -z "$UNCL_STARTED" ]]; then
     /home/suraj/.cargo/bin/uncl
 fi
 ```
-
