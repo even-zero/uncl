@@ -2,6 +2,13 @@
 name = "uncl"
 version = "0.1.13"
 edition = "2024"
+description = "a single, toggleable, resizable floating terminal window as an accomplice to your worst terminal misdeeds"
+readme = "readme.md"
+license = "MIT"
+repository = "https://github.com/even-zero/uncl"
+homepage = "https://github.com/even-zero/uncl"
+keywords = ["terminal", "multiplexer", "tui", "shell", "window"]
+categories = ["command-line-utilities", "terminal"]
 
 [dependencies]
 crossterm = "0.29"
