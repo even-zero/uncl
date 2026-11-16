@@ -396,6 +396,10 @@ jobs:
   # The crates.io upload needs a `CARGO_REGISTRY_TOKEN` repository secret: an API
   # token from https://crates.io/settings/access-tokens with permission to
   # publish `uncl`.
+  #
+  # The crate is uploaded before the draft is made public: if the upload fails,
+  # the draft stays unpublished and a re-run picks it up again, so a public
+  # release is never missing from crates.io.
   # ---------------------------------------------------------------------------
   publish:
     name: publish the newest draft
@@ -432,10 +436,61 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
+      # Check out before touching the release: `gh release edit` shells out to
+      # git when publishing a draft, so the workspace must be a repository. And
+      # the crate on crates.io must be the same commit whose binaries shipped,
+      # so use the draft's target rather than the trigger.
+      - uses: actions/checkout@v4
+        if: steps.draft.outputs.published == 'true'
+        with:
+          ref: ${{ steps.draft.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.draft.outputs.published == 'true'
+
+      - name: publish to crates.io
+        if: steps.draft.outputs.published == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # crates.io can take a while before it starts accepting the upload
+          # body, and cargo aborts transfers under 10 bytes/sec for 30s by
+          # default.
+          CARGO_HTTP_LOW_SPEED_LIMIT: "0"
+          CARGO_HTTP_TIMEOUT: "300"
+          TAG: ${{ steps.draft.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is missing: add a crates.io API token to the repository secrets."
+            exit 1
+          fi
+
+          # The tag, the commit, and the manifest must all agree on the version.
+          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Cargo.toml says $manifest_version but the release is v$version."
+            exit 1
+          fi
+
+          # A re-run after a successful publish must not fail the job.
+          if curl -sf -H "User-Agent: cargo (github-actions)" \
+               "https://crates.io/api/v1/crates/uncl/$version" >/dev/null; then
+            echo "::notice::uncl v$version is already on crates.io; skipping"
+            exit 0
+          fi
+
+          cargo publish --locked
+
       - name: publish
         if: steps.draft.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.draft.outputs.tag }}
         run: |
           set -euo pipefail
