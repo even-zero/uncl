@@ -1,12 +1,10 @@
 name: release
 
-# Each code-bearing push gets a new base-99 release counter. Master builds its
-# own source, never an unrelated dev draft. Manual dispatch forces a rebuild.
+# dev tests, increments the base-99 version, and builds a draft release.
+# master only publishes the newest draft and its exact source to crates.io.
 on:
   push:
     branches: [dev, master]
-  pull_request:
-    paths: ['.github/**']
   workflow_dispatch:
     inputs:
       publish:
@@ -18,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || 'pipeline' }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -28,6 +26,10 @@ env:
 
 jobs:
   guard:
+    if: >-
+      !github.event.repository.fork
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/dev')
+          || (github.event_name == 'workflow_dispatch' && inputs.publish != true && github.ref == 'refs/heads/dev'))
     runs-on: ubuntu-22.04
     outputs:
       run: ${{ steps.filter.outputs.run }}
@@ -35,30 +37,31 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Test release counter
-        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Detect unreleased code (commit titles never suppress fixes)
         id: filter
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
-          FORK: ${{ github.event.repository.fork }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = pull_request ] || [ "$FORK" = true ]; then
-            echo 'run=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if [ "$EVENT" = workflow_dispatch ]; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Compare to the last public release, not a draft or commit message.
-          tag="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName // empty')"
-          if [ -z "$tag" ]; then
+          # Compare to the newest draft source, falling back to the public
+          # release. Commit titles never suppress a fix (including squash PRs).
+          tag="$(gh release list --limit 100 --json tagName,isDraft -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
+          base=""
+          if [ -n "$tag" ]; then
+            base="$(gh release view "$tag" --json targetCommitish -q .targetCommitish)"
+            [[ "$base" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$base^{commit}"
+          else
+            base="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName // empty')"
+          fi
+          if [ -z "$base" ]; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$tag" HEAD -- src Cargo.toml Cargo.lock; then
+          elif git diff --quiet "$base" HEAD -- src Cargo.toml Cargo.lock; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
           else
             echo 'run=true' >> "$GITHUB_OUTPUT"
@@ -79,12 +82,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
       - name: Allocate version and persist the exact release source
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           git fetch --tags --force origin
-          version="$(python3 .github/scripts/release_version.py)"
+          # Base 99: PATCH and MINOR range from 0 through 98.
+          next_version() {
+            local major minor patch
+            IFS=. read -r major minor patch <<< "$1"
+            major=$((10#$major)); minor=$((10#$minor)); patch=$((10#$patch))
+            minor=$((minor + (patch + 1) / 99))
+            patch=$(((patch + 1) % 99))
+            major=$((major + minor / 99))
+            minor=$((minor % 99))
+            printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+          }
+          # Keep rollover regression tests beside the actual implementation.
+          test "$(next_version 0.1.15)" = 0.1.16
+          test "$(next_version 0.1.98)" = 0.2.0
+          test "$(next_version 0.98.98)" = 1.0.0
+          current="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          # Include drafts so a replacement never reuses a reserved number.
+          drafts="$(gh release list --limit 100 --json tagName -q '.[].tagName')"
+          previous="$( { printf '%s\n' "$current" "$drafts"; git tag --list 'v*'; } |
+            sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          version="$(next_version "$previous")"
+          cargo set-version "$version"
+          sed -i -E "s/^v[0-9]+\.[0-9]+\.[0-9]+$/v$version/" readme.md
           cargo metadata --locked --no-deps --format-version 1 > /dev/null
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -182,7 +213,7 @@ jobs:
           # don't let the default 90 day retention linger in the artifacts tab.
           retention-days: 7
 
-  publish:
+  draft:
     needs: [prepare, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -194,7 +225,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - uses: dtolnay/rust-toolchain@stable
       - name: Create draft from this run only
         env:
           GH_TOKEN: ${{ github.token }}
@@ -204,15 +234,56 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "v$VERSION" dist/* --draft --target "$SHA" --title "uncl v$VERSION" --generate-notes
+      - name: Remove superseded drafts after the new one is ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          while read -r old; do
+            [ -z "$old" ] || [ "$old" = "$TAG" ] || gh release delete "$old" --yes
+          done < <(gh release list --limit 100 --json tagName,isDraft -q '.[] | select(.isDraft) | .tagName')
+
+  publish:
+    if: >-
+      !github.event.repository.fork
+      && github.ref == 'refs/heads/master'
+      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Select the newest dev draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release list --limit 100 --json tagName,isDraft -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
+          if [ -z "$tag" ]; then
+            echo '::error::No draft to publish. Run the release workflow on dev first.'
+            exit 1
+          fi
+          sha="$(gh release view "$tag" --json targetCommitish -q .targetCommitish)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.draft.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
       - name: Publish crate before making GitHub release public
-        if: github.ref == 'refs/heads/master' || inputs.publish == true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           CARGO_HTTP_LOW_SPEED_LIMIT: '0'
           CARGO_HTTP_TIMEOUT: '300'
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ steps.draft.outputs.version }}
         run: |
           set -euo pipefail
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          test "$manifest_version" = "$VERSION"
           test -n "$CARGO_REGISTRY_TOKEN" || { echo '::error::CARGO_REGISTRY_TOKEN is missing'; exit 1; }
           # Fail closed on registry outages; only a confirmed 404 means absent.
           status="$(curl -sS -o /tmp/crate.json -w '%{http_code}' -H 'User-Agent: uncl-release' "https://crates.io/api/v1/crates/uncl/$VERSION")"
@@ -221,10 +292,9 @@ jobs:
             404) cargo publish --locked ;;
             *) echo "::error::crates.io returned $status"; exit 1 ;;
           esac
-      - name: Publish this run's GitHub release
-        if: github.ref == 'refs/heads/master' || inputs.publish == true
+      - name: Publish the selected draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ steps.draft.outputs.version }}
         run: gh release edit "v$VERSION" --draft=false --latest
