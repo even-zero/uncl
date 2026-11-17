@@ -1,6 +1,6 @@
 [package]
 name = "uncl"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 description = "a single, toggleable, resizable floating terminal window as an accomplice to your worst terminal misdeeds"
 readme = "readme.md"

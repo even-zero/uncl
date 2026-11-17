@@ -1,37 +1,20 @@
 name: release
 
-#   dev  -> test, bump the patch version, build every platform, replace the
-#           *draft* release. The draft is not visible until someone publishes it.
-# master -> publish the newest draft, then push the same version to crates.io so
-#           `cargo install uncl` picks it up. Publishing is the only step that
-#           creates the tag and makes a release visible, so `master` stays the
-#           switch.
-#
-# The version lives in Cargo.toml and is bumped in a commit pushed back to the
-# branch, so the repository always says which version is being prepared.
-
-# The release branch is `master`: it is named here, and again in the `if:` of
-# the publish job at the bottom.
-#
-# Before testing or bumping, the prepare job rebases onto the latest tip of the
-# branch it is working on, so a release build never has to wait on a manual
-# pull/rebase between pushes.
+# dev tests, increments the base-99 version, and builds a draft release.
+# master only publishes the newest draft and its exact source to crates.io.
 on:
   push:
     branches: [dev, master]
   workflow_dispatch:
     inputs:
       publish:
-        description: "publish the newest draft instead of preparing a release"
+        description: Publish to GitHub and crates.io (otherwise create a draft)
         type: boolean
         default: false
 
 permissions:
   contents: write
 
-# A version bump is a push to the branch that triggers this workflow again.
-# Serialising the whole workflow means two merges can never race for the same
-# version number, and a publish never overlaps a release in flight.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -39,121 +22,52 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # `cargo build` on a hosted runner has 4 cores; the default jobs setting
-  # spends more time context-switching than building.
   CARGO_BUILD_JOBS: 4
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Decide whether this push is worth a release at all: only a change to code
-  # (src/, Cargo.toml, Cargo.lock) counts. A docs or readme push stops here, in
-  # about ten seconds, instead of spending four platform builds on nothing.
-  # ---------------------------------------------------------------------------
   guard:
-    name: is this a code change?
     if: >-
       !github.event.repository.fork
       && ((github.event_name == 'push' && github.ref == 'refs/heads/dev')
-          || (github.event_name == 'workflow_dispatch' && inputs.publish != true))
+          || (github.event_name == 'workflow_dispatch' && inputs.publish != true && github.ref == 'refs/heads/dev'))
     runs-on: ubuntu-22.04
-    timeout-minutes: 5
     outputs:
       run: ${{ steps.filter.outputs.run }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: filter
+      - name: Detect unreleased code (commit titles never suppress fixes)
         id: filter
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-
-          # workflow_dispatch means somebody asked for a release by hand.
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "requested by hand"
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          # This workflow pushes a version bump to the branch it is building.
-          # The bump commit only touches Cargo.toml, which is exactly what the
-          # filter below looks for, so it marks itself. GITHUB_TOKEN pushes do
-          # not re-trigger workflows either: this is the second of two brakes on
-          # the same loop.
-          if grep -qF '[skip release]' <<< "$(git log -1 --pretty=%B "$AFTER")"; then
-            echo "::notice::commit is marked [skip release]"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          git fetch --tags --force --quiet origin
-
-          # Compare against the commit already built in a waiting draft release
-          # (or, when no draft exists, the newest release tag) before falling
-          # back to github.event.before. That way an earlier code push whose run
-          # failed or was skipped is still picked up on the next push.
+          # Compare to the newest draft source, falling back to the public
+          # release. Commit titles never suppress a fix (including squash PRs).
+          tag="$(gh release list --limit 100 --json tagName,isDraft -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
           base=""
-          draft_tag="$(gh release list --json tagName,isDraft --limit 100 \
-                         -q 'first(.[] | select(.isDraft)) | .tagName // empty' 2>/dev/null || true)"
-          if [ -n "$draft_tag" ] && [ "$draft_tag" != "null" ]; then
-            draft_sha="$(gh release view "$draft_tag" --json targetCommitish \
-                           -q '.targetCommitish // empty' 2>/dev/null || true)"
-            if [[ "$draft_sha" =~ ^[0-9a-f]{40}$ ]] \
-               && git cat-file -e "$draft_sha^{commit}" 2>/dev/null; then
-              base="$draft_sha"
-              echo "comparing against current draft $draft_tag ($base)"
-            fi
-          fi
-
-          if [ -z "$base" ]; then
-            last_tag="$(git describe --tags --abbrev=0 --match 'v*' "$AFTER" 2>/dev/null || true)"
-            if [ -n "$last_tag" ] && git cat-file -e "$last_tag^{commit}" 2>/dev/null; then
-              base="$last_tag"
-              echo "comparing against latest tag $base"
-            fi
-          fi
-
-          if [ -z "$base" ] && [ -n "$BEFORE" ] \
-             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
-             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            base="$BEFORE"
-            echo "comparing against push parent $base"
-          fi
-
-          # A brand new branch, or a force-push whose parent we never saw, has no
-          # usable diff. Releasing is the safe assumption.
-          if [ -z "$base" ]; then
-            echo "no baseline commit to compare against; assuming code changed"
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          changed="$(git diff --name-only "$base" "$AFTER")"
-          echo "changed files ($base..$AFTER):"
-          printf '%s\n' "$changed" | sed 's/^/  /'
-
-          if grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$)' <<< "$changed"; then
-            echo "code changed"
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then
+            base="$(gh release view "$tag" --json targetCommitish -q .targetCommitish)"
+            [[ "$base" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$base^{commit}"
           else
-            echo "::notice::no change under src/ or in Cargo.toml; nothing to release"
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            base="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName // empty')"
+          fi
+          if [ -z "$base" ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$base" HEAD -- src Cargo.toml Cargo.lock; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
           fi
 
-  # ---------------------------------------------------------------------------
-  # Test, then decide the version. The version is only bumped when the one in
-  # Cargo.toml has already been published: while a draft is waiting for master,
-  # further pushes to dev rebuild it under the same number instead of piling up
-  # drafts of versions nobody will ever see.
-  # ---------------------------------------------------------------------------
   prepare:
-    name: test and version
     needs: guard
     if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-22.04
@@ -161,100 +75,59 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       sha: ${{ steps.version.outputs.sha }}
-      bumped: ${{ steps.version.outputs.bumped }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: rebase on the latest tip of the branch
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --force origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
-          git rebase "origin/${GITHUB_REF_NAME}"
-
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      # Tests come first: a red tree must not get a version number.
-      - name: cargo test
-        run: cargo test --locked --all-targets
-
+      - run: cargo test --locked --all-targets
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-edit
-
-      - name: version
+      - name: Allocate version and persist the exact release source
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          git fetch --tags --force --quiet origin
-
-          # The only line in Cargo.toml that starts with `version` is the
-          # [package] one; dependency versions are quoted inline.
-          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          echo "Cargo.toml says $version"
-
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            published=true
-          else
-            published=false
-          fi
-
-          # `gh release view` on a missing release exits non-zero; on a draft it
-          # prints `true`. A draft reserves the number but has no tag yet, which
-          # is why both are checked.
-          draft="$(gh release view "v$version" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
-          echo "published=$published draft=$draft"
-
-          bumped=false
-          if [ "$published" = true ]; then
-            previous="$version"
-            cargo set-version --bump patch
-            version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-            bumped=true
-            echo "v$previous is out; preparing v$version"
-          else
-            echo "v$version is not released yet; keeping it"
-          fi
-
-          sha="$(git rev-parse HEAD)"
-
-          if [ "$bumped" = true ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            # Keep the version banner in the readme in step with the bump: the
-            # version lives on line 5, inside the ascii art fence, and the
-            # commit below picks this edit up.
-            sed -i -E "s/^v[0-9]+\.[0-9]+\.[0-9]+$/v$version/" readme.md
-            grep -n "^v[0-9]" readme.md
-
-            # The marker stops this workflow from treating its own push as a
-            # code change. `cargo set-version` keeps Cargo.lock in step, so the
-            # `--locked` build below stays valid.
-            git commit -am "chore: release v$version [skip release]"
-            sha="$(git rev-parse HEAD)"
-            if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "::error::could not push the version bump to ${GITHUB_REF_NAME}."
-              echo "::error::branch protection must let github-actions[bot] push, or the workflow token needs write access."
-              exit 1
-            fi
-            echo "pushed the bump commit $sha"
-          fi
-
+          git fetch --tags --force origin
+          # Base 99: PATCH and MINOR range from 0 through 98.
+          next_version() {
+            local major minor patch
+            IFS=. read -r major minor patch <<< "$1"
+            major=$((10#$major)); minor=$((10#$minor)); patch=$((10#$patch))
+            minor=$((minor + (patch + 1) / 99))
+            patch=$(((patch + 1) % 99))
+            major=$((major + minor / 99))
+            minor=$((minor % 99))
+            printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+          }
+          # Keep rollover regression tests beside the actual implementation.
+          test "$(next_version 0.1.15)" = 0.1.16
+          test "$(next_version 0.1.98)" = 0.2.0
+          test "$(next_version 0.98.98)" = 1.0.0
+          current="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          # Include drafts so a replacement never reuses a reserved number.
+          drafts="$(gh release list --limit 100 --json tagName -q '.[].tagName')"
+          previous="$( { printf '%s\n' "$current" "$drafts"; git tag --list 'v*'; } |
+            sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          version="$(next_version "$previous")"
+          cargo set-version "$version"
+          sed -i -E "s/^v[0-9]+\.[0-9]+\.[0-9]+$/v$version/" readme.md
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock readme.md
+          git commit -m "chore: release v$version"
+          # GITHUB_TOKEN pushes do not trigger another workflow. No magic skip
+          # marker that could accidentally suppress a later squash-merged fix.
+          # A concurrent push rejects this update rather than shipping stale code.
+          git push origin "HEAD:$GITHUB_REF_NAME"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "bumped=$bumped" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # An ordinary release build on an ordinary runner: no cross-compilation
-  # tricks, no containers. Each target builds on the OS it runs on, so what is
-  # shipped is what the platform's own linker produced.
-  # ---------------------------------------------------------------------------
   build:
     # Keep `${{ matrix.slug }}` out of `name:`: when `build` is skipped (e.g. on
     # `master` or docs-only pushes), GitHub Actions skips matrix expansion and
@@ -340,26 +213,19 @@ jobs:
           # don't let the default 90 day retention linger in the artifacts tab.
           retention-days: 7
 
-  # ---------------------------------------------------------------------------
-  # Replace the draft. Older drafts are removed so that "publish the newest
-  # draft" can never publish something stale.
-  # ---------------------------------------------------------------------------
   draft:
-    name: draft release
     needs: [prepare, build]
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
-
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-
-      - name: replace the draft
+      - name: Create draft from this run only
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -367,183 +233,68 @@ jobs:
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -euo pipefail
-          tag="v$VERSION"
-          ls -l dist
-
+          gh release create "v$VERSION" dist/* --draft --target "$SHA" --title "uncl v$VERSION" --generate-notes
+      - name: Remove superseded drafts after the new one is ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
           while read -r old; do
-            [ -n "$old" ] || continue
-            echo "removing stale draft $old"
-            gh release delete "$old" --yes --cleanup-tag || true
-          done < <(gh release list --json tagName,isDraft --limit 100 \
-                     -q '.[] | select(.isDraft) | .tagName')
+            [ -z "$old" ] || [ "$old" = "$TAG" ] || gh release delete "$old" --yes
+          done < <(gh release list --limit 100 --json tagName,isDraft -q '.[] | select(.isDraft) | .tagName')
 
-          # A draft reserves the tag name but does not create the tag; it
-          # appears when the release is published.
-          gh release create "$tag" dist/* \
-            --draft \
-            --target "$SHA" \
-            --title "uncl $tag" \
-            --generate-notes
-
-          gh release view "$tag" --json isDraft,assets \
-            -q '"draft=" + (.isDraft|tostring) + " assets=" + ([.assets[].name]|join(", "))'
-
-  # ---------------------------------------------------------------------------
-  # The publish half. Runs only on master (or when asked for by hand), and quits
-  # quietly when no draft is waiting: merging master with nothing pending is a
-  # normal thing to do, not a failure.
-  #
-  # The crates.io upload needs a `CARGO_REGISTRY_TOKEN` repository secret: an API
-  # token from https://crates.io/settings/access-tokens with permission to
-  # publish `uncl`.
-  #
-  # The crate is uploaded before the draft is made public: if the upload fails,
-  # the draft stays unpublished and a re-run picks it up again, so a public
-  # release is never missing from crates.io.
-  # ---------------------------------------------------------------------------
   publish:
-    name: publish the newest draft
     if: >-
       !github.event.repository.fork
-      && ((github.event_name == 'push' && github.ref == 'refs/heads/master')
-          || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+      && github.ref == 'refs/heads/master'
+      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     runs-on: ubuntu-22.04
-    # The crates.io upload compiles the crate from scratch, which is far slower
-    # than the release publish itself.
     timeout-minutes: 30
     steps:
-      - name: find the newest draft
+      - name: Select the newest dev draft
         id: draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          # `gh release list` is newest first, so the first draft is the one to
-          # publish and the newest build is the one that ships.
-          tag="$(gh release list --json tagName,isDraft --limit 100 \
-                   -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
-
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-            echo "::notice::no draft release to publish; nothing to do"
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          tag="$(gh release list --limit 100 --json tagName,isDraft -q 'first(.[] | select(.isDraft)) | .tagName // empty')"
+          if [ -z "$tag" ]; then
+            echo '::error::No draft to publish. Run the release workflow on dev first.'
+            exit 1
           fi
-
           sha="$(gh release view "$tag" --json targetCommitish -q .targetCommitish)"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-
-      # Check out before touching the release: `gh release edit` shells out to
-      # git when publishing a draft, so the workspace must be a repository. And
-      # the crate on crates.io must be the same commit whose binaries shipped,
-      # so use the draft's target rather than the trigger.
       - uses: actions/checkout@v4
-        if: steps.draft.outputs.published == 'true'
         with:
           ref: ${{ steps.draft.outputs.sha }}
-          fetch-depth: 0
-          fetch-tags: true
-
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.draft.outputs.published == 'true'
-
-      - name: publish to crates.io
-        if: steps.draft.outputs.published == 'true'
+      - name: Publish crate before making GitHub release public
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          # crates.io can take a while before it starts accepting the upload
-          # body, and cargo aborts transfers under 10 bytes/sec for 30s by
-          # default.
-          CARGO_HTTP_LOW_SPEED_LIMIT: "0"
-          CARGO_HTTP_TIMEOUT: "300"
-          TAG: ${{ steps.draft.outputs.tag }}
+          CARGO_HTTP_LOW_SPEED_LIMIT: '0'
+          CARGO_HTTP_TIMEOUT: '300'
+          VERSION: ${{ steps.draft.outputs.version }}
         run: |
           set -euo pipefail
-
-          version="${TAG#v}"
-
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is missing: add a crates.io API token to the repository secrets."
-            exit 1
-          fi
-
-          # The tag, the commit, and the manifest must all agree on the version.
-          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "$manifest_version" != "$version" ]; then
-            echo "::error::Cargo.toml says $manifest_version but the release is v$version."
-            exit 1
-          fi
-
-          # A re-run after a successful publish must not fail the job.
-          if curl -sf -H "User-Agent: cargo (github-actions)" \
-               "https://crates.io/api/v1/crates/uncl/$version" >/dev/null; then
-            echo "::notice::uncl v$version is already on crates.io; skipping"
-            exit 0
-          fi
-
-          cargo publish --locked
-
-      - name: publish
-        if: steps.draft.outputs.published == 'true'
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          test "$manifest_version" = "$VERSION"
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo '::error::CARGO_REGISTRY_TOKEN is missing'; exit 1; }
+          # Fail closed on registry outages; only a confirmed 404 means absent.
+          status="$(curl -sS -o /tmp/crate.json -w '%{http_code}' -H 'User-Agent: uncl-release' "https://crates.io/api/v1/crates/uncl/$VERSION")"
+          case "$status" in
+            200) echo 'Version already published' ;;
+            404) cargo publish --locked ;;
+            *) echo "::error::crates.io returned $status"; exit 1 ;;
+          esac
+      - name: Publish the selected draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.draft.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          echo "publishing $TAG"
-          # This is the step that creates the tag and makes the release public.
-          gh release edit "$TAG" --draft=false --latest
-
-          gh release view "$TAG" --json tagName,isDraft,url \
-            -q '"published " + .tagName + " (" + .url + ")"'
-
-      # The crate on crates.io must be the same commit whose binaries shipped in
-      # the release, so check out the draft's target rather than the trigger.
-      - uses: actions/checkout@v4
-        if: steps.draft.outputs.published == 'true'
-        with:
-          ref: ${{ steps.draft.outputs.sha }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.draft.outputs.published == 'true'
-
-      - name: publish to crates.io
-        if: steps.draft.outputs.published == 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          # crates.io can take a while before it starts accepting the upload
-          # body, and cargo aborts transfers under 10 bytes/sec for 30s by
-          # default.
-          CARGO_HTTP_LOW_SPEED_LIMIT: "0"
-          CARGO_HTTP_TIMEOUT: "300"
-          TAG: ${{ steps.draft.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          version="${TAG#v}"
-
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is missing: add a crates.io API token to the repository secrets."
-            exit 1
-          fi
-
-          # The tag, the commit, and the manifest must all agree on the version.
-          manifest_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [ "$manifest_version" != "$version" ]; then
-            echo "::error::Cargo.toml says $manifest_version but the release is v$version."
-            exit 1
-          fi
-
-          # A re-run after a successful publish must not fail the job.
-          if curl -sf -H "User-Agent: cargo (github-actions)" \
-               "https://crates.io/api/v1/crates/uncl/$version" >/dev/null; then
-            echo "::notice::uncl v$version is already on crates.io; skipping"
-            exit 0
-          fi
-
-          cargo publish --locked
+          VERSION: ${{ steps.draft.outputs.version }}
+        run: gh release edit "v$VERSION" --draft=false --latest
