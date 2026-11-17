@@ -249,8 +249,7 @@ pub fn spawn(
                                 // would wait for a timeout. The tap has the bytes, so
                                 // it answers them here (S3.7).
                                 if kind == Kind::Dcs {
-                                    if let Some(reply) =
-                                        dcs::reply(parser.screen(), &caps, &bytes)
+                                    if let Some(reply) = dcs::reply(parser.screen(), &caps, &bytes)
                                     {
                                         reader_sink.send(reply);
                                         continue;
@@ -265,10 +264,8 @@ pub fn spawn(
                                     let anchor = parser.screen().cursor_position();
                                     let (rows, cols) = parser.screen().size();
                                     let area = (cols.get(), rows.get());
-                                    let ingest = store
-                                        .lock()
-                                        .unwrap()
-                                        .ingest(kind, &bytes, anchor, area);
+                                    let ingest =
+                                        store.lock().unwrap().ingest(kind, &bytes, anchor, area);
                                     match ingest {
                                         Ingest::Stored => kept = true,
                                         Ingest::Reply(reply) => {
@@ -372,19 +369,16 @@ mod cursor_save_restore_tests {
     #[test]
     fn parser_restores_cursor_for_btop_style_dialog_lines() {
         let mut filter = CursorSaveRestore::default();
-        let mut parser = vt100::Parser::new(
-            NonZeroU16::new(6).unwrap(),
-            NonZeroU16::new(12).unwrap(),
-            0,
-        );
+        let mut parser =
+            vt100::Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(12).unwrap(), 0);
         let bytes = b"\x1b[2;3H\x1b[s\x1b[5;8HXY\x1b[uZ";
         let normalized = filter.feed(bytes);
         parser.process(&normalized);
 
         let screen = parser.screen();
-        assert_eq!(screen.cell(4, 7).contents(), "X");
-        assert_eq!(screen.cell(4, 8).contents(), "Y");
-        assert_eq!(screen.cell(1, 2).contents(), "Z");
+        assert_eq!(screen.cell(4, 7).unwrap().contents(), "X");
+        assert_eq!(screen.cell(4, 8).unwrap().contents(), "Y");
+        assert_eq!(screen.cell(1, 2).unwrap().contents(), "Z");
         assert_eq!(screen.cursor_position(), (1, 3));
     }
 }
